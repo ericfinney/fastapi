@@ -148,9 +148,6 @@ def build_description_one_cell(sign: Dict[str, Any]) -> str:
 CELL_RE = re.compile(r"^([A-Z]+)(\d+)$")
 
 def shift_cell_ref(cell_ref: str, row_offset: int) -> str:
-    """
-    Shift a single A1-style reference by row_offset.
-    """
     m = CELL_RE.match(cell_ref)
     if not m:
         return cell_ref
@@ -172,7 +169,7 @@ def split_ref(ref: str):
 def shift_range_overlap_safe(a1_range: str, footer_start_row: int, row_offset: int) -> str:
     """
     Shift merged ranges if they are below the footer boundary OR overlap it.
-    This prevents merge corruption when a merge spans across the insertion row.
+    Prevents merge corruption when a merge spans across the insertion row.
     """
     a, b = parse_range(a1_range)
     a_col, a_row = split_ref(a)
@@ -184,7 +181,6 @@ def shift_range_overlap_safe(a1_range: str, footer_start_row: int, row_offset: i
     top = min(a_row, b_row)
     bottom = max(a_row, b_row)
 
-    # Shift if fully below OR overlapping footer boundary
     should_shift = (top >= footer_start_row) or (top < footer_start_row <= bottom)
 
     def apply_shift(ref):
@@ -214,8 +210,10 @@ def restore_merges(ws, merges: List[str], footer_start_row: int, row_offset: int
 def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
     """
     Copy styles + row height from src_row to dst_row.
+    This includes borders (dst.border = copy(src.border)).
     """
     ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+
     for col in range(1, max_col + 1):
         src = ws.cell(row=src_row, column=col)
         dst = ws.cell(row=dst_row, column=col)
@@ -225,7 +223,7 @@ def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
 
         dst.number_format = src.number_format
         dst.alignment = copy(src.alignment)
-        dst.border = copy(src.border)
+        dst.border = copy(src.border)         # ✅ keeps border
         dst.fill = copy(src.fill)
         dst.font = copy(src.font)
         dst.protection = copy(src.protection)
@@ -263,24 +261,20 @@ def adjust_body_rows_preserve_footer(
     max_col = ws.max_column  # copy styles across full width
 
     if diff > 0:
-        # Insert rows before footer
         logging.info(f"Inserting {diff} row(s) at {footer_start} to expand body.")
         ws.insert_rows(footer_start, amount=diff)
 
-        # Copy style from last template body row into inserted rows
+        # Copy style from last template body row (body_end) into inserted rows
         for r in range(footer_start, footer_start + diff):
             copy_row_style(ws, src_row=body_end, dst_row=r, max_col=max_col)
 
     else:
-        # Delete rows from bottom of body AFTER the needed body content
         delete_count = abs(diff)
         delete_start = body_start + needed_rows
         logging.info(f"Deleting {delete_count} row(s) at {delete_start} to shrink body.")
         ws.delete_rows(delete_start, amount=delete_count)
 
-    # Restore merges (shift below/overlapping footer boundary)
     restore_merges(ws, merges, footer_start, diff)
-
     return diff
 
 
@@ -308,13 +302,10 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
     Excel true AutoFit is not available via openpyxl.
     This approximates it by estimating the number of wrapped lines.
 
-    - Considers explicit line breaks (\n)
-    - Also estimates wrapping based on character length
-    - Applies row height only in the specified range (body only)
+    With column width ~50 and line height 15, a good heuristic is ~60 chars per line.
     """
-    # Rough heuristic: ~45 characters per line for your template's description column width.
-    CHARS_PER_LINE = 45
-    LINE_HEIGHT = 15  # points per line (typical default)
+    CHARS_PER_LINE = 60  # tuned for width ~50
+    LINE_HEIGHT = 15     # you specified 15
 
     for r in range(row_start, row_end + 1):
         max_lines = 1
@@ -332,7 +323,6 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
                 if not ln:
                     line_count += 1
                 else:
-                    # Estimate wrapped lines
                     wrapped = max(1, (len(ln) // CHARS_PER_LINE) + (1 if len(ln) % CHARS_PER_LINE else 0))
                     line_count += wrapped
 
@@ -380,21 +370,16 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
 
-        # Always reinsert logo (template images may be dropped by openpyxl)
         insert_logo(ws)
 
-        # ---------------------------------------------------------
-        # Header mapping
-        # ---------------------------------------------------------
+        # ---------------- Header mapping ----------------
         write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
         write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
         write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
         write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
         write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
 
-        # ---------------------------------------------------------
-        # Sold-to / Ship-to
-        # ---------------------------------------------------------
+        # ---------------- Sold-to / Ship-to ----------------
         sold_to = estimate_data.get("sold_to", {}) or {}
         ship_to = estimate_data.get("ship_to", {}) or {}
 
@@ -418,16 +403,13 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         write_cell(ws, "C16", ship_csz)
         write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-        # ---------------------------------------------------------
-        # Dynamic body resize (Option 2)
-        # ---------------------------------------------------------
+        # ---------------- Dynamic body resize ----------------
         sign_types = estimate_data.get("sign_types", []) or []
         sign_count = len(sign_types)
 
         BODY_START = 28
         BODY_END = 47
         EXTRA_BLANK = 3
-        FOOTER_BASE_START = BODY_END + 1
 
         footer_row_offset = adjust_body_rows_preserve_footer(
             ws,
@@ -437,16 +419,13 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             extra_blank_rows=EXTRA_BLANK
         )
 
-        # After resize, clear the body rows we are about to use (prevents template leftovers)
+        # Clear the rows we will use (prevents template leftovers)
         total_body_rows_needed = sign_count + EXTRA_BLANK
         for r in range(BODY_START, BODY_START + total_body_rows_needed):
             for c in ["A", "B", "C", "D", "E", "F"]:
                 ws[f"{c}{r}"].value = None
 
-        # ---------------------------------------------------------
-        # Write sign lines (left-shifted)
-        # Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
-        # ---------------------------------------------------------
+        # ---------------- Write sign lines ----------------
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
         current_row = BODY_START
         item_num = 1
@@ -469,32 +448,16 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             current_row += 1
             item_num += 1
 
-        # Leave 3 blank rows after last sign (already cleared above)
+        # 3 blank rows already cleared; just advance pointer if needed
         current_row += EXTRA_BLANK
 
-        # ---------------------------------------------------------
-        # Approximate AutoFit row heights for body range only
-        # (Keeps footer stable)
-        # ---------------------------------------------------------
-        body_last_row = BODY_START + total_body_rows_needed - 1
-        approximate_autofit_rows(
-            ws,
-            row_start=BODY_START,
-            row_end=body_last_row,
-            text_cols=[COL_DESC],   # description column is the one that wraps most
-            min_height=15.0
-        )
-
-        # ---------------------------------------------------------
-        # Totals (hard-coded footer cells shifted)
-        # ---------------------------------------------------------
+        # ---------------- Totals (hard-coded cells shifted) ----------------
         totals = estimate_data.get("totals", {}) or {}
         subtotal = safe_num(totals.get("sub_total"))
         grand_total = safe_num(totals.get("total"))
         shipping_total = sum_extended(estimate_data.get("shipping"))
         install_total = sum_extended(estimate_data.get("installation"))
 
-        # Base footer cell references from the original template (before shifting)
         SUBTOTAL_CELL = "F48"
         SHIPPING_CELL = "F49"
         INSTALL_CELL = "F53"
@@ -509,9 +472,18 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         if grand_total is not None:
             write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
-        # ---------------------------------------------------------
-        # Save output workbook
-        # ---------------------------------------------------------
+        # ---------------- Approximate AutoFit row heights BELOW ROW 26 ----------------
+        # Apply to all rows 27 -> last used row
+        last_used_row = ws.max_row
+        approximate_autofit_rows(
+            ws,
+            row_start=27,
+            row_end=last_used_row,
+            text_cols=["C"],     # Description column is C; other columns can be added if needed
+            min_height=15.0
+        )
+
+        # ---------------- Save output workbook ----------------
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
