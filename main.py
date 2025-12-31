@@ -6,17 +6,18 @@ from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import FileResponse
-
 from openpyxl import load_workbook
 
 # ---------------------------------------------------------
-# Configuration
+# Logging
 # ---------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 
+# ---------------------------------------------------------
+# Configuration (override with Railway Variables if desired)
+# ---------------------------------------------------------
 TEMPLATE_PATH = os.environ.get("BOYD_TEMPLATE_PATH", "templates/Blank.xlsm")
 SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
-
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -83,7 +84,6 @@ def build_sign_description(sign: Dict[str, Any]) -> str:
         return base
     return comp_summary
 
-
 def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
     """
     Sum extended_total across a list of items.
@@ -104,40 +104,47 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
 
 
 # ---------------------------------------------------------
-# Health check endpoint (handy for Railway)
+# Health check endpoint (useful for Railway)
 # ---------------------------------------------------------
 @app.get("/")
 def root():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "template_exists": os.path.exists(TEMPLATE_PATH),
+        "template_path": TEMPLATE_PATH,
+        "sheet_name": SHEET_NAME
+    }
 
 
 # ---------------------------------------------------------
-# Main endpoint
-# Expected request body:
-#   { "body": { ... estimate json ... } }
+# MAIN ENDPOINT
+# The GPT Action sends:
+#   { "payload": "<json string>" }
+# We parse payload into estimate_data dict
 # ---------------------------------------------------------
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
-    # Log incoming payload for debugging in Railway logs
-    logging.info("Incoming payload: %s", json.dumps(payload) if payload else "None")
+    # Log incoming payload keys for debugging (avoid logging full payload string)
+    logging.info("Incoming request: payload keys = %s", list(payload.keys()) if payload else None)
 
     # Validate request body
-    if not payload:
-        raise HTTPException(status_code=400, detail="Missing request body")
+    if not payload or "payload" not in payload:
+        raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
-    if "body" not in payload:
-        raise HTTPException(status_code=400, detail="Missing 'body' field containing estimate JSON")
+    # Parse JSON string
+    try:
+        estimate_data = json.loads(payload["payload"])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON string in 'payload': {str(e)}")
 
-    estimate_data = payload["body"]
-
-    if not isinstance(estimate_data, dict) or len(estimate_data) == 0:
-        raise HTTPException(status_code=400, detail="'body' must be a non-empty JSON object")
+    if not isinstance(estimate_data, dict) or not estimate_data:
+        raise HTTPException(status_code=400, detail="Decoded 'payload' must be a non-empty JSON object.")
 
     # Validate template exists
     if not os.path.exists(TEMPLATE_PATH):
         raise HTTPException(
             status_code=500,
-            detail=f"Template file not found at {TEMPLATE_PATH}. Ensure templates/Blank.xlsm exists in deployment."
+            detail=f"Template file not found at {TEMPLATE_PATH}. Ensure templates/Blank.xlsm is committed."
         )
 
     # Load workbook (keep_vba preserves macros in .xlsm)
@@ -152,53 +159,54 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     ws = wb[SHEET_NAME]
 
     # ---------------------------------------------------------
-    # Write header fields (adjust cells as needed)
+    # Write header fields (adjust cells if needed)
     # ---------------------------------------------------------
-    # Based on your template: Date is in E5 (merged)
+    # Date in E5
     write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
 
-    # OPTIONAL: If you want these written, uncomment and adjust the cells:
+    # Optional: map project id/description if you want them on the sheet.
+    # Uncomment and adjust cells:
     # write_cell(ws, "E7", safe_str(estimate_data.get("project_id")))
     # write_cell(ws, "E8", safe_str(estimate_data.get("project_description")))
 
     # ---------------------------------------------------------
-    # Write sold-to and ship-to blocks (adjust cells as needed)
+    # Sold-to / Ship-to blocks
     # ---------------------------------------------------------
     sold_to = estimate_data.get("sold_to", {}) or {}
     ship_to = estimate_data.get("ship_to", {}) or {}
 
-    # SOLD TO block (right side)
+    # SOLD TO (right)
     write_cell(ws, "D11", safe_str(sold_to.get("name")))
     write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
-
-    sold_city = safe_str(sold_to.get("city"))
-    sold_state = safe_str(sold_to.get("state"))
-    sold_zip = safe_str(sold_to.get("zip"))
-    sold_csz = " ".join([p for p in [sold_city, sold_state, sold_zip] if p])
+    sold_csz = " ".join([p for p in [
+        safe_str(sold_to.get("city")),
+        safe_str(sold_to.get("state")),
+        safe_str(sold_to.get("zip"))
+    ] if p and p.strip()])
     write_cell(ws, "D16", sold_csz)
     write_cell(ws, "D17", safe_str(sold_to.get("phone")))
 
-    # SHIP TO block (left side)
+    # SHIP TO (left)
     write_cell(ws, "C11", safe_str(ship_to.get("name")))
     write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
-
-    ship_city = safe_str(ship_to.get("city"))
-    ship_state = safe_str(ship_to.get("state"))
-    ship_zip = safe_str(ship_to.get("zip"))
-    ship_csz = " ".join([p for p in [ship_city, ship_state, ship_zip] if p])
+    ship_csz = " ".join([p for p in [
+        safe_str(ship_to.get("city")),
+        safe_str(ship_to.get("state")),
+        safe_str(ship_to.get("zip"))
+    ] if p and p.strip()])
     write_cell(ws, "C16", ship_csz)
     write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
     # ---------------------------------------------------------
-    # Write sign type summary rows into main table
-    # Table header row is 26, items start at 27
+    # Line items table (Sign Type summary lines only)
+    # Header row 26, items start row 27
     # ---------------------------------------------------------
     start_row = 27
     current_row = start_row
 
     sign_types = estimate_data.get("sign_types", []) or []
 
-    # Column mapping based on your sheet:
+    # Column mapping based on your template
     # C = Item
     # D = Sign Type
     # E = Description
@@ -221,15 +229,14 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
         ws[f"{COL_UNIT}{current_row}"].value = safe_num(sign.get("unit_price"))
 
-        # If your template uses formulas, you can remove this write.
+        # If your template has formulas, you can remove this:
         ws[f"{COL_TOTAL}{current_row}"].value = safe_num(sign.get("extended_total"))
 
         current_row += 1
         item_num += 1
 
     # ---------------------------------------------------------
-    # Write totals section
-    # Adjust cells as needed based on your template layout
+    # Totals section (adjust cells if needed)
     # ---------------------------------------------------------
     totals = estimate_data.get("totals", {}) or {}
     subtotal = safe_num(totals.get("sub_total"))
@@ -238,11 +245,11 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     shipping_total = sum_extended(estimate_data.get("shipping"))
     install_total = sum_extended(estimate_data.get("installation"))
 
-    # These are based on the template’s labels around rows 48-54:
-    # Subtotal at H48
-    # Shipping at H49
-    # Installation at H53
-    # Grand Total at H54
+    # Based on template label positions:
+    # Subtotal: H48
+    # Shipping: H49
+    # Installation: H53
+    # Grand Total: H54
     if subtotal is not None:
         write_cell(ws, "H48", subtotal)
     if shipping_total is not None:
@@ -253,7 +260,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         write_cell(ws, "H54", grand_total)
 
     # ---------------------------------------------------------
-    # Save output workbook
+    # Save and return workbook
     # ---------------------------------------------------------
     out_name = f"Boyd_Proposal_{uuid.uuid4().hex}.xlsm"
     out_path = os.path.join(OUTPUT_DIR, out_name)
