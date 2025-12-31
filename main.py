@@ -3,7 +3,6 @@ import uuid
 import json
 import logging
 import re
-import subprocess
 from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, Body, HTTPException
@@ -12,15 +11,13 @@ from openpyxl import load_workbook
 
 logging.basicConfig(level=logging.INFO)
 
-TEMPLATE_PATH = os.environ.get("BOYD_TEMPLATE_PATH", "templates/Blank.xlsm")
+# ✅ Switch to XLSX template (no macros)
+TEMPLATE_PATH = os.environ.get("BOYD_TEMPLATE_PATH", "templates/Blank.xlsx")
 SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 
 # Use /tmp for hosted environments
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# OPTIONAL: Set this in Railway variables to "true" to preserve header images better
-ENABLE_LIBREOFFICE_RESAVE = os.environ.get("ENABLE_LIBREOFFICE_RESAVE", "false").lower() == "true"
 
 app = FastAPI()
 
@@ -81,7 +78,7 @@ def split_sign_type_and_summary(raw_sign_type: str):
       'D-Donor Room'
     => sign_type='D', summary='Donor Room'
 
-    Also supports codes like:
+    Also supports:
       'A1 - Something'
       'D2- Something'
     => sign_type='A1', summary='Something'
@@ -91,41 +88,37 @@ def split_sign_type_and_summary(raw_sign_type: str):
 
     s = raw_sign_type.strip()
 
-    # Match a leading code (letters/numbers), optional spaces, dash, optional spaces, then summary
+    # ✅ Leading code + dash + summary (spaces optional around dash)
     m = re.match(r"^([A-Za-z0-9]+)\s*-\s*(.+)$", s)
     if m:
         code = m.group(1).strip()
         summary = m.group(2).strip()
         return code, summary
 
-    # If no dash split found, return as-is
     return s, ""
 
 def build_sign_description(sign: Dict[str, Any]) -> str:
     """
     Description cell rules:
-    - First line: summary extracted from sign_type if formatted "CODE - SUMMARY"
-    - Then: additional description (if not duplicate)
+    - Line 1: summary extracted from sign_type if formatted "CODE - SUMMARY"
+    - Line 2+: base description (if not duplicate)
     - Then: component bullet summary
     """
     raw_sign_type = safe_str(sign.get("sign_type"))
     _, summary_from_type = split_sign_type_and_summary(raw_sign_type)
 
     base = safe_str(sign.get("description")).strip()
-
     comps = sign.get("components") or []
     comp_summary = summarize_components(comps).strip()
 
     lines = []
 
-    # First line: summary (preferred)
+    # ✅ First line is always summary if available
     if summary_from_type:
         lines.append(summary_from_type)
-        # Add base if it adds value and isn't identical
         if base and base.lower() != summary_from_type.lower():
             lines.append(base)
     else:
-        # Otherwise, base description is the first line
         if base:
             lines.append(base)
 
@@ -147,30 +140,6 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
     return total if found else None
 
 
-def libreoffice_resave_xlsm(path: str):
-    """
-    OPTIONAL post-processing step that re-saves the file using LibreOffice.
-    This helps preserve header logos/images that openpyxl may drop.
-    Requires LibreOffice installed on Railway.
-    """
-    out_dir = os.path.dirname(path)
-    logging.info("LibreOffice re-save enabled. Re-saving file via soffice...")
-    subprocess.run(
-        [
-            "soffice",
-            "--headless",
-            "--nologo",
-            "--nolockcheck",
-            "--convert-to",
-            "xlsm",
-            "--outdir",
-            out_dir,
-            path,
-        ],
-        check=True,
-    )
-
-
 # ---------------------------------------------------------
 # Health check
 # ---------------------------------------------------------
@@ -180,8 +149,7 @@ def root():
         "status": "ok",
         "template_exists": os.path.exists(TEMPLATE_PATH),
         "template_path": TEMPLATE_PATH,
-        "sheet_name": SHEET_NAME,
-        "libreoffice_resave_enabled": ENABLE_LIBREOFFICE_RESAVE,
+        "sheet_name": SHEET_NAME
     }
 
 
@@ -207,39 +175,54 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
 
     try:
-        wb = load_workbook(TEMPLATE_PATH, keep_vba=True)
+        wb = load_workbook(TEMPLATE_PATH)
         if SHEET_NAME not in wb.sheetnames:
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
 
-        # Header
+        # ---------------------------------------------------------
+        # Header / mapped fields
+        # ---------------------------------------------------------
         write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
+        write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
+        write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
+        write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
+        write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
 
-        # Sold-to / Ship-to
+        # ---------------------------------------------------------
+        # Sold-to / Ship-to blocks
+        # ---------------------------------------------------------
         sold_to = estimate_data.get("sold_to", {}) or {}
         ship_to = estimate_data.get("ship_to", {}) or {}
 
         write_cell(ws, "D11", safe_str(sold_to.get("name")))
         write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
-        sold_csz = " ".join(
-            [p for p in [safe_str(sold_to.get("city")), safe_str(sold_to.get("state")), safe_str(sold_to.get("zip"))] if p.strip()]
-        )
+        sold_csz = " ".join([p for p in [
+            safe_str(sold_to.get("city")),
+            safe_str(sold_to.get("state")),
+            safe_str(sold_to.get("zip"))
+        ] if p.strip()])
         write_cell(ws, "D16", sold_csz)
         write_cell(ws, "D17", safe_str(sold_to.get("phone")))
 
         write_cell(ws, "C11", safe_str(ship_to.get("name")))
         write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
-        ship_csz = " ".join(
-            [p for p in [safe_str(ship_to.get("city")), safe_str(ship_to.get("state")), safe_str(ship_to.get("zip"))] if p.strip()]
-        )
+        ship_csz = " ".join([p for p in [
+            safe_str(ship_to.get("city")),
+            safe_str(ship_to.get("state")),
+            safe_str(ship_to.get("zip"))
+        ] if p.strip()])
         write_cell(ws, "C16", ship_csz)
         write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-        # Line items
-        start_row = 28  # <-- requested
+        # ---------------------------------------------------------
+        # Line items table
+        # Start row = 28
+        # Shift LEFT by 2 columns: Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
+        # ---------------------------------------------------------
+        start_row = 28
         current_row = start_row
 
-        # Shift LEFT mapping: Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
 
         sign_types = estimate_data.get("sign_types", []) or []
@@ -253,8 +236,10 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
 
             ws[f"{COL_DESC}{current_row}"].value = build_sign_description(sign)
+
             ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
 
+            # ✅ Round unit price to nearest dollar
             unit_price = safe_num(sign.get("unit_price"))
             ws[f"{COL_UNIT}{current_row}"].value = round(unit_price) if unit_price is not None else None
 
@@ -263,7 +248,9 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             current_row += 1
             item_num += 1
 
-        # Totals (shift LEFT)
+        # ---------------------------------------------------------
+        # Totals section (shift left by 2: H -> F)
+        # ---------------------------------------------------------
         totals = estimate_data.get("totals", {}) or {}
         subtotal = safe_num(totals.get("sub_total"))
         grand_total = safe_num(totals.get("total"))
@@ -280,15 +267,13 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         if grand_total is not None:
             write_cell(ws, "F54", grand_total)
 
-        # Save file
+        # ---------------------------------------------------------
+        # Save output workbook
+        # ---------------------------------------------------------
         file_id = uuid.uuid4().hex
-        out_name = f"Boyd_Proposal_{file_id}.xlsm"
+        out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
         wb.save(out_path)
-
-        # Optional LibreOffice re-save for preserving header/logo images
-        if ENABLE_LIBREOFFICE_RESAVE:
-            libreoffice_resave_xlsm(out_path)
 
     except Exception as e:
         logging.exception("Proposal generation failed")
@@ -307,8 +292,9 @@ def download_file(filename: str):
     file_path = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
+
     return FileResponse(
         file_path,
-        media_type="application/vnd.ms-excel.sheet.macroEnabled.12",
-        filename=filename
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename,
     )
