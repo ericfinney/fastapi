@@ -43,9 +43,6 @@ def write_cell(ws, cell: str, value):
     ws[cell].value = value
 
 def summarize_components(components: List[Dict[str, Any]], max_lines: int = 4) -> str:
-    """
-    Condenses component details into short bullet lines.
-    """
     if not components:
         return ""
     lines = []
@@ -80,14 +77,10 @@ def split_sign_type_and_summary(raw_sign_type: str):
     """
     if not raw_sign_type:
         return "", ""
-
     s = raw_sign_type.strip()
-
-    # Code prefix + dash + summary (spaces optional around dash)
     m = re.match(r"^([A-Za-z0-9]+)\s*-\s*(.+)$", s)
     if m:
         return m.group(1).strip(), m.group(2).strip()
-
     return s, ""
 
 def build_description_one_cell(sign: Dict[str, Any]) -> str:
@@ -105,7 +98,6 @@ def build_description_one_cell(sign: Dict[str, Any]) -> str:
     comp_summary = summarize_components(comps).strip()
 
     lines = []
-
     if summary:
         lines.append(summary)
         if base and base.lower() != summary.lower():
@@ -134,19 +126,46 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
 def insert_logo(ws):
     """
     Reinserts logo at A1 every time.
-    openpyxl does not reliably preserve template images after save.
+    Requires Pillow installed (pip install pillow).
     """
     if not os.path.exists(LOGO_PATH):
         logging.warning(f"Logo not found at {LOGO_PATH}; skipping insert.")
         return
 
     img = XLImage(LOGO_PATH)
-
-    # OPTIONAL: If you need size control, uncomment and tweak:
-    # img.width = 220
-    # img.height = 80
-
     ws.add_image(img, "A1")
+
+
+def adjust_body_rows(ws, sign_count: int, body_start: int = 28, body_end: int = 47, extra_blank_rows: int = 3):
+    """
+    Ensures the body section has enough rows to fit:
+      sign_count + extra_blank_rows
+    Body is initially body_start..body_end (inclusive).
+    Footer begins at body_end + 1.
+    
+    If needed rows > base rows, inserts rows right before footer.
+    If needed rows < base rows, deletes rows from within the body so footer shifts up.
+    """
+    base_rows = body_end - body_start + 1
+    needed_rows = sign_count + extra_blank_rows
+
+    footer_start = body_end + 1
+    diff = needed_rows - base_rows
+
+    if diff > 0:
+        # Need more body rows: insert diff rows before footer
+        logging.info(f"Inserting {diff} rows at {footer_start} to expand body from {base_rows} to {needed_rows}.")
+        ws.insert_rows(footer_start, amount=diff)
+
+    elif diff < 0:
+        # Too many body rows: delete rows from the bottom part of the body
+        delete_count = abs(diff)
+        delete_start = body_start + needed_rows  # first row AFTER the needed body content
+        logging.info(f"Deleting {delete_count} rows at {delete_start} to shrink body from {base_rows} to {needed_rows}.")
+        ws.delete_rows(delete_start, amount=delete_count)
+
+    # If diff == 0, body is already correct size
+    return needed_rows
 
 
 # ---------------------------------------------------------
@@ -230,18 +249,34 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
         # ---------------------------------------------------------
-        # Line items table
-        # Start row = 28
-        # Shift LEFT by 2: Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
+        # BODY RANGE RULES
+        # Body is rows 28..47 in the template (20 rows)
+        # Must fit sign_count + 3 blank lines
         # ---------------------------------------------------------
-        start_row = 28
-        current_row = start_row
+        sign_types = estimate_data.get("sign_types", []) or []
+        sign_count = len(sign_types)
 
+        BODY_START = 28
+        BODY_END = 47
+        EXTRA_BLANK = 3
+
+        needed_body_rows = adjust_body_rows(
+            ws,
+            sign_count=sign_count,
+            body_start=BODY_START,
+            body_end=BODY_END,
+            extra_blank_rows=EXTRA_BLANK
+        )
+
+        # ---------------------------------------------------------
+        # Line items table (shift left): A-F
+        # ---------------------------------------------------------
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
 
-        sign_types = estimate_data.get("sign_types", []) or []
+        current_row = BODY_START
         item_num = 1
 
+        # Write sign types
         for sign in sign_types:
             ws[f"{COL_ITEM}{current_row}"].value = item_num
 
@@ -249,12 +284,9 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             clean_type, _ = split_sign_type_and_summary(raw_type)
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
 
-            # ✅ One-cell description with summary on first line
             ws[f"{COL_DESC}{current_row}"].value = build_description_one_cell(sign)
-
             ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
 
-            # ✅ Round unit price to nearest dollar
             unit_price = safe_num(sign.get("unit_price"))
             ws[f"{COL_UNIT}{current_row}"].value = round(unit_price) if unit_price is not None else None
 
@@ -263,24 +295,57 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             current_row += 1
             item_num += 1
 
+        # Ensure 3 blank lines after the last sign type
+        blank_rows_to_write = EXTRA_BLANK
+        for _ in range(blank_rows_to_write):
+            # Clear cells in the blank rows, just in case template had placeholders
+            for col in [COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL]:
+                ws[f"{col}{current_row}"].value = None
+            current_row += 1
+
+        # (If the template body is larger than needed, adjust_body_rows already deleted extras)
+
         # ---------------------------------------------------------
-        # Totals section (shift left by 2: H -> F)
+        # Totals section
+        # ⚠️ NOTE: Totals cells may SHIFT if footer moved.
+        # Because we insert/delete rows ABOVE the footer, totals positions shift with the footer automatically.
+        # But the cell references (F48 etc.) are now no longer stable.
+        #
+        # ✅ Best practice: Anchor totals relative to the "SUBTOTAL" label cell.
+        # For now, if your totals are below the body, you should locate them by label.
         # ---------------------------------------------------------
+
+        # --- FIND totals by label (recommended, stable) ---
+        def find_cell_with_text(ws, text: str):
+            text = text.strip().lower()
+            for row in ws.iter_rows():
+                for cell in row:
+                    if isinstance(cell.value, str) and cell.value.strip().lower() == text:
+                        return cell
+            return None
+
         totals = estimate_data.get("totals", {}) or {}
         subtotal = safe_num(totals.get("sub_total"))
         grand_total = safe_num(totals.get("total"))
-
         shipping_total = sum_extended(estimate_data.get("shipping"))
         install_total = sum_extended(estimate_data.get("installation"))
 
-        if subtotal is not None:
-            write_cell(ws, "F48", subtotal)
-        if shipping_total is not None:
-            write_cell(ws, "F49", shipping_total)
-        if install_total is not None:
-            write_cell(ws, "F53", install_total)
-        if grand_total is not None:
-            write_cell(ws, "F54", grand_total)
+        # Example: label "Subtotal:" might be in column E and value in F. Adjust if needed.
+        subtotal_label = find_cell_with_text(ws, "subtotal:")
+        if subtotal_label and subtotal is not None:
+            ws.cell(row=subtotal_label.row, column=subtotal_label.column + 1).value = subtotal
+
+        shipping_label = find_cell_with_text(ws, "shipping:")
+        if shipping_label and shipping_total is not None:
+            ws.cell(row=shipping_label.row, column=shipping_label.column + 1).value = shipping_total
+
+        installation_label = find_cell_with_text(ws, "installation:")
+        if installation_label and install_total is not None:
+            ws.cell(row=installation_label.row, column=installation_label.column + 1).value = install_total
+
+        total_label = find_cell_with_text(ws, "total:")
+        if total_label and grand_total is not None:
+            ws.cell(row=total_label.row, column=total_label.column + 1).value = grand_total
 
         # ---------------------------------------------------------
         # Save output workbook
