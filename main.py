@@ -78,8 +78,7 @@ def build_sign_description(sign: Dict[str, Any]) -> str:
 # -------------------------
 
 @app.post("/generate_proposal")
-def generate_proposal(payload: Dict[str, Any] = Body(...)):
-    estimate_data = payload.get("estimate_data", {})
+def generate_proposal(estimate_data: Dict[str, Any] = Body(...)):
 
     wb = load_workbook(TEMPLATE_PATH, keep_vba=True)
     ws = wb[SHEET_NAME]
