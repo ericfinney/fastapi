@@ -19,6 +19,36 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
 
+def build_sign_description(sign: Dict[str, Any]) -> str:
+    raw_sign_type = safe_str(sign.get("sign_type"))
+    cleaned_sign_type, summary_from_type = split_sign_type_and_summary(raw_sign_type)
+
+    # base description from JSON (may already include summary, may not)
+    base = safe_str(sign.get("description")).strip()
+
+    # component bullets
+    comps = sign.get("components") or []
+    comp_summary = summarize_components(comps).strip()
+
+    # Build final description:
+    # 1) First line = summary_from_type if present, else base
+    # 2) Below = base (if it is not identical) then component bullets
+    lines = []
+
+    if summary_from_type:
+        lines.append(summary_from_type)
+
+        # Include base if it is useful and not duplicate
+        if base and base.lower() != summary_from_type.lower():
+            lines.append(base)
+    else:
+        if base:
+            lines.append(base)
+
+    if comp_summary:
+        lines.append(comp_summary)
+
+    return "\n".join([ln for ln in lines if ln])
 
 def safe_str(x) -> str:
     return "" if x is None else str(x)
@@ -137,13 +167,15 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         # Line items
         start_row = 27
         current_row = start_row
-        COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "C", "D", "E", "F", "G", "H"
+        COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
 
         sign_types = estimate_data.get("sign_types", []) or []
         item_num = 1
         for sign in sign_types:
             ws[f"{COL_ITEM}{current_row}"].value = item_num
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = safe_str(sign.get("sign_type"))
+            raw_type = safe_str(sign.get("sign_type"))
+            clean_type, _ = split_sign_type_and_summary(raw_type)
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
             ws[f"{COL_DESC}{current_row}"].value = build_sign_description(sign)
             ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
             ws[f"{COL_UNIT}{current_row}"].value = safe_num(sign.get("unit_price"))
@@ -159,13 +191,13 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         install_total = sum_extended(estimate_data.get("installation"))
 
         if subtotal is not None:
-            write_cell(ws, "H48", subtotal)
+            write_cell(ws, "F48", subtotal)
         if shipping_total is not None:
-            write_cell(ws, "H49", shipping_total)
+            write_cell(ws, "F49", shipping_total)
         if install_total is not None:
-            write_cell(ws, "H53", install_total)
+            write_cell(ws, "F53", install_total)
         if grand_total is not None:
-            write_cell(ws, "H54", grand_total)
+            write_cell(ws, "F54", grand_total)
 
         # Save file
         file_id = uuid.uuid4().hex
