@@ -43,31 +43,6 @@ def join_address_lines(addr_lines: List[str]) -> str:
 def write_cell(ws, cell: str, value):
     ws[cell].value = value
 
-def summarize_components(components: List[Dict[str, Any]], max_lines: int = 4) -> str:
-    if not components:
-        return ""
-    lines = []
-    for c in components[:max_lines]:
-        desc = safe_str(c.get("description")).strip()
-        dims = safe_str(c.get("dimensions")).strip()
-        qty = c.get("qty")
-
-        parts = []
-        if desc:
-            parts.append(desc)
-        if dims:
-            parts.append(dims)
-        if qty is not None:
-            parts.append(f"Qty {qty}")
-
-        if parts:
-            lines.append("• " + " | ".join(parts))
-
-    if len(components) > max_lines:
-        lines.append("• (additional components omitted)")
-
-    return "\n".join(lines)
-
 def insert_logo(ws):
     """
     Reinserts logo at A1 every time. Pillow must be installed.
@@ -77,6 +52,29 @@ def insert_logo(ws):
         return
     img = XLImage(LOGO_PATH)
     ws.add_image(img, "A1")
+
+
+# =========================================================
+# Footer row height capture/restore
+# =========================================================
+def capture_row_heights(ws, start_row: int, end_row: int) -> dict:
+    """
+    Capture row heights from the template.
+    Returns {row_number: height or None}.
+    """
+    heights = {}
+    for r in range(start_row, end_row + 1):
+        heights[r] = ws.row_dimensions[r].height
+    return heights
+
+def restore_row_heights(ws, heights: dict, row_offset: int):
+    """
+    Restore captured row heights, shifted by row_offset.
+    Example: original row 48 height is applied to row 48 + row_offset.
+    """
+    for original_row, height in heights.items():
+        target_row = original_row + row_offset
+        ws.row_dimensions[target_row].height = height
 
 
 # =========================================================
@@ -115,35 +113,20 @@ def split_sign_type_and_summary(raw_sign_type: str):
 
 def build_description_one_cell(sign: Dict[str, Any]) -> str:
     """
-    One cell:
-      Line 1: summary (from sign_type)
-      Line 2+: base description (if not duplicate)
-      Line 3+: component bullets
+    Description should show ONLY the summary from sign_type (the part after '-').
+    If no dash exists, fallback to the sign['description'].
     """
     raw_sign_type = safe_str(sign.get("sign_type"))
     _, summary = split_sign_type_and_summary(raw_sign_type)
 
-    base = safe_str(sign.get("description")).strip()
-    comps = sign.get("components") or []
-    comp_summary = summarize_components(comps).strip()
-
-    lines = []
     if summary:
-        lines.append(summary)
-        if base and base.lower() != summary.lower():
-            lines.append(base)
-    else:
-        if base:
-            lines.append(base)
+        return summary.strip()
 
-    if comp_summary:
-        lines.append(comp_summary)
-
-    return "\n".join([ln for ln in lines if ln])
+    return safe_str(sign.get("description")).strip()
 
 
 # =========================================================
-# Row/merge shifting helpers (Critical for Option 2)
+# Merge shifting helpers (Critical for Option 2)
 # =========================================================
 CELL_RE = re.compile(r"^([A-Z]+)(\d+)$")
 
@@ -210,7 +193,7 @@ def restore_merges(ws, merges: List[str], footer_start_row: int, row_offset: int
 def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
     """
     Copy styles + row height from src_row to dst_row.
-    This includes borders (dst.border = copy(src.border)).
+    Includes borders.
     """
     ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
 
@@ -223,7 +206,7 @@ def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
 
         dst.number_format = src.number_format
         dst.alignment = copy(src.alignment)
-        dst.border = copy(src.border)         # ✅ keeps border
+        dst.border = copy(src.border)         # ✅ keeps borders
         dst.fill = copy(src.fill)
         dst.font = copy(src.font)
         dst.protection = copy(src.protection)
@@ -258,13 +241,12 @@ def adjust_body_rows_preserve_footer(
     merges = save_merged_ranges(ws)
     unmerge_all(ws, merges)
 
-    max_col = ws.max_column  # copy styles across full width
+    max_col = ws.max_column
 
     if diff > 0:
         logging.info(f"Inserting {diff} row(s) at {footer_start} to expand body.")
         ws.insert_rows(footer_start, amount=diff)
 
-        # Copy style from last template body row (body_end) into inserted rows
         for r in range(footer_start, footer_start + diff):
             copy_row_style(ws, src_row=body_end, dst_row=r, max_col=max_col)
 
@@ -299,13 +281,12 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
 # =========================================================
 def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[str], min_height: float = 15.0):
     """
-    Excel true AutoFit is not available via openpyxl.
-    This approximates it by estimating the number of wrapped lines.
-
-    With column width ~50 and line height 15, a good heuristic is ~60 chars per line.
+    Approximates AutoFit:
+    - column width ~50 => ~60 characters per line
+    - line height = 15
     """
-    CHARS_PER_LINE = 60  # tuned for width ~50
-    LINE_HEIGHT = 15     # you specified 15
+    CHARS_PER_LINE = 60
+    LINE_HEIGHT = 15
 
     for r in range(row_start, row_end + 1):
         max_lines = 1
@@ -372,6 +353,11 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
         insert_logo(ws)
 
+        # ✅ Capture template footer row heights BEFORE any insertion/deletion
+        FOOTER_HEIGHT_START = 48
+        FOOTER_HEIGHT_END = 120
+        footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
+
         # ---------------- Header mapping ----------------
         write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
         write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
@@ -419,7 +405,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             extra_blank_rows=EXTRA_BLANK
         )
 
-        # Clear the rows we will use (prevents template leftovers)
+        # Clear the body rows we will use
         total_body_rows_needed = sign_count + EXTRA_BLANK
         for r in range(BODY_START, BODY_START + total_body_rows_needed):
             for c in ["A", "B", "C", "D", "E", "F"]:
@@ -437,7 +423,9 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             clean_type, _ = split_sign_type_and_summary(raw_type)
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
 
+            # ✅ Description shows only the summary
             ws[f"{COL_DESC}{current_row}"].value = build_description_one_cell(sign)
+
             ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
 
             unit_price = safe_num(sign.get("unit_price"))
@@ -447,9 +435,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
             current_row += 1
             item_num += 1
-
-        # 3 blank rows already cleared; just advance pointer if needed
-        current_row += EXTRA_BLANK
 
         # ---------------- Totals (hard-coded cells shifted) ----------------
         totals = estimate_data.get("totals", {}) or {}
@@ -472,16 +457,18 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         if grand_total is not None:
             write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
-        # ---------------- Approximate AutoFit row heights BELOW ROW 26 ----------------
-        # Apply to all rows 27 -> last used row
+        # ---------------- Row height adjustment below row 26 ----------------
         last_used_row = ws.max_row
         approximate_autofit_rows(
             ws,
             row_start=27,
             row_end=last_used_row,
-            text_cols=["C"],     # Description column is C; other columns can be added if needed
+            text_cols=["C"],
             min_height=15.0
         )
+
+        # ✅ Restore footer row heights to template values (shifted)
+        restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
         # ---------------- Save output workbook ----------------
         file_id = uuid.uuid4().hex
