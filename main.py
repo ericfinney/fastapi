@@ -8,15 +8,15 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from openpyxl import load_workbook
+from openpyxl.drawing.image import Image as XLImage
 
 logging.basicConfig(level=logging.INFO)
 
-# ✅ Switch to XLSX template (no macros)
 TEMPLATE_PATH = os.environ.get("BOYD_TEMPLATE_PATH", "templates/Blank.xlsx")
 SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
-
-# Use /tmp for hosted environments
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
+LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
@@ -77,35 +77,28 @@ def split_sign_type_and_summary(raw_sign_type: str):
       'D- Donor Room'
       'D-Donor Room'
     => sign_type='D', summary='Donor Room'
-
-    Also supports:
-      'A1 - Something'
-      'D2- Something'
-    => sign_type='A1', summary='Something'
     """
     if not raw_sign_type:
         return "", ""
 
     s = raw_sign_type.strip()
 
-    # ✅ Leading code + dash + summary (spaces optional around dash)
+    # Code prefix + dash + summary (spaces optional around dash)
     m = re.match(r"^([A-Za-z0-9]+)\s*-\s*(.+)$", s)
     if m:
-        code = m.group(1).strip()
-        summary = m.group(2).strip()
-        return code, summary
+        return m.group(1).strip(), m.group(2).strip()
 
     return s, ""
 
-def build_sign_description(sign: Dict[str, Any]) -> str:
+def build_description_one_cell(sign: Dict[str, Any]) -> str:
     """
-    Description cell rules:
-    - Line 1: summary extracted from sign_type if formatted "CODE - SUMMARY"
-    - Line 2+: base description (if not duplicate)
-    - Then: component bullet summary
+    ONE CELL description format:
+      Line 1: summary (from sign_type split) if available
+      Line 2+: base description (if not duplicate)
+      Line 3+: bullet components
     """
     raw_sign_type = safe_str(sign.get("sign_type"))
-    _, summary_from_type = split_sign_type_and_summary(raw_sign_type)
+    _, summary = split_sign_type_and_summary(raw_sign_type)
 
     base = safe_str(sign.get("description")).strip()
     comps = sign.get("components") or []
@@ -113,10 +106,9 @@ def build_sign_description(sign: Dict[str, Any]) -> str:
 
     lines = []
 
-    # ✅ First line is always summary if available
-    if summary_from_type:
-        lines.append(summary_from_type)
-        if base and base.lower() != summary_from_type.lower():
+    if summary:
+        lines.append(summary)
+        if base and base.lower() != summary.lower():
             lines.append(base)
     else:
         if base:
@@ -139,6 +131,23 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
             found = True
     return total if found else None
 
+def insert_logo(ws):
+    """
+    Reinserts logo at A1 every time.
+    openpyxl does not reliably preserve template images after save.
+    """
+    if not os.path.exists(LOGO_PATH):
+        logging.warning(f"Logo not found at {LOGO_PATH}; skipping insert.")
+        return
+
+    img = XLImage(LOGO_PATH)
+
+    # OPTIONAL: If you need size control, uncomment and tweak:
+    # img.width = 220
+    # img.height = 80
+
+    ws.add_image(img, "A1")
+
 
 # ---------------------------------------------------------
 # Health check
@@ -149,7 +158,9 @@ def root():
         "status": "ok",
         "template_exists": os.path.exists(TEMPLATE_PATH),
         "template_path": TEMPLATE_PATH,
-        "sheet_name": SHEET_NAME
+        "sheet_name": SHEET_NAME,
+        "logo_exists": os.path.exists(LOGO_PATH),
+        "logo_path": LOGO_PATH
     }
 
 
@@ -179,6 +190,9 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         if SHEET_NAME not in wb.sheetnames:
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
+
+        # ✅ Ensure logo is present in output
+        insert_logo(ws)
 
         # ---------------------------------------------------------
         # Header / mapped fields
@@ -218,7 +232,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         # ---------------------------------------------------------
         # Line items table
         # Start row = 28
-        # Shift LEFT by 2 columns: Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
+        # Shift LEFT by 2: Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
         # ---------------------------------------------------------
         start_row = 28
         current_row = start_row
@@ -235,7 +249,8 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             clean_type, _ = split_sign_type_and_summary(raw_type)
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
 
-            ws[f"{COL_DESC}{current_row}"].value = build_sign_description(sign)
+            # ✅ One-cell description with summary on first line
+            ws[f"{COL_DESC}{current_row}"].value = build_description_one_cell(sign)
 
             ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
 
