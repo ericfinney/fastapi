@@ -3,7 +3,8 @@ import uuid
 import json
 import logging
 import re
-from typing import Dict, Any, List, Optional
+from copy import copy
+from typing import Dict, Any, List, Optional, Tuple
 
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -22,9 +23,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 app = FastAPI()
 
 
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
+# =========================================================
+# Basic helpers
+# =========================================================
 def safe_str(x) -> str:
     return "" if x is None else str(x)
 
@@ -67,28 +68,48 @@ def summarize_components(components: List[Dict[str, Any]], max_lines: int = 4) -
 
     return "\n".join(lines)
 
+def insert_logo(ws):
+    """
+    Reinserts logo at A1 every time. Pillow must be installed.
+    """
+    if not os.path.exists(LOGO_PATH):
+        logging.warning(f"Logo not found at {LOGO_PATH}; skipping insert.")
+        return
+    img = XLImage(LOGO_PATH)
+    ws.add_image(img, "A1")
+
+
+# =========================================================
+# Sign type + summary split (robust)
+# =========================================================
 def split_sign_type_and_summary(raw_sign_type: str):
     """
-    Handles:
-      'D - Donor Room'
-      'D- Donor Room'
-      'D-Donor Room'
-    => sign_type='D', summary='Donor Room'
+    Supports:
+      D - Donor Room
+      D- Donor Room
+      E5.W - 12x18 DOT, Wall Mount
+      A1.2 - Something
+      E5/W - Something
     """
     if not raw_sign_type:
         return "", ""
+
     s = raw_sign_type.strip()
-    m = re.match(r"^([A-Za-z0-9]+)\s*-\s*(.+)$", s)
+
+    # Code can contain letters/numbers/dots/slashes/underscores
+    m = re.match(r"^([A-Za-z0-9./_]+)\s*-\s*(.+)$", s)
     if m:
         return m.group(1).strip(), m.group(2).strip()
+
     return s, ""
+
 
 def build_description_one_cell(sign: Dict[str, Any]) -> str:
     """
-    ONE CELL description format:
-      Line 1: summary (from sign_type split) if available
+    One cell:
+      Line 1: summary (from sign_type)
       Line 2+: base description (if not duplicate)
-      Line 3+: bullet components
+      Line 3+: component bullets
     """
     raw_sign_type = safe_str(sign.get("sign_type"))
     _, summary = split_sign_type_and_summary(raw_sign_type)
@@ -111,6 +132,132 @@ def build_description_one_cell(sign: Dict[str, Any]) -> str:
 
     return "\n".join([ln for ln in lines if ln])
 
+
+# =========================================================
+# Row/merge shifting helpers (critical for Option 2)
+# =========================================================
+CELL_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
+def shift_cell_ref(cell_ref: str, row_offset: int) -> str:
+    """
+    Shift a single A1-style reference by row_offset.
+    """
+    m = CELL_RE.match(cell_ref)
+    if not m:
+        return cell_ref
+    col, row = m.group(1), int(m.group(2))
+    return f"{col}{row + row_offset}"
+
+def parse_range(a1_range: str) -> Tuple[str, str]:
+    if ":" in a1_range:
+        a, b = a1_range.split(":")
+        return a, b
+    return a1_range, a1_range
+
+def shift_range_if_needed(a1_range: str, start_row_threshold: int, row_offset: int) -> str:
+    """
+    Shift merged range rows ONLY if the range is at or below start_row_threshold.
+    """
+    a, b = parse_range(a1_range)
+
+    def shift_if(rowref: str) -> str:
+        m = CELL_RE.match(rowref)
+        if not m:
+            return rowref
+        col, row = m.group(1), int(m.group(2))
+        if row >= start_row_threshold:
+            row += row_offset
+        return f"{col}{row}"
+
+    a2 = shift_if(a)
+    b2 = shift_if(b)
+    return f"{a2}:{b2}" if ":" in a1_range else a2
+
+def save_merged_ranges(ws) -> List[str]:
+    return [str(rng) for rng in ws.merged_cells.ranges]
+
+def unmerge_all(ws, merges: List[str]):
+    for rng in merges:
+        ws.unmerge_cells(rng)
+
+def restore_merges(ws, merges: List[str], footer_start_row: int, row_offset: int):
+    for rng in merges:
+        new_rng = shift_range_if_needed(rng, footer_start_row, row_offset)
+        ws.merge_cells(new_rng)
+
+def copy_row_style(ws, src_row: int, dst_row: int, min_col: int = 1, max_col: int = 50):
+    """
+    Copy cell styles, row height, and some properties from src_row to dst_row.
+    """
+    ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+    for col in range(min_col, max_col + 1):
+        src = ws.cell(row=src_row, column=col)
+        dst = ws.cell(row=dst_row, column=col)
+
+        if src.has_style:
+            dst._style = copy(src._style)
+
+        dst.number_format = src.number_format
+        dst.alignment = copy(src.alignment)
+        dst.border = copy(src.border)
+        dst.fill = copy(src.fill)
+        dst.font = copy(src.font)
+        dst.protection = copy(src.protection)
+
+
+# =========================================================
+# Body adjust (Option 2)
+# =========================================================
+def adjust_body_rows_preserve_footer(
+    ws,
+    sign_count: int,
+    body_start: int = 28,
+    body_end: int = 47,
+    extra_blank_rows: int = 3,
+    style_copy_width_cols: int = 30
+) -> int:
+    """
+    Ensures body has sign_count + extra_blank_rows rows.
+    Inserts/deletes rows at the footer boundary while preserving merges and styles.
+
+    Returns row_offset applied to the footer (positive = pushed down, negative = pulled up)
+    """
+    base_rows = body_end - body_start + 1
+    needed_rows = sign_count + extra_blank_rows
+    footer_start = body_end + 1
+    diff = needed_rows - base_rows  # positive -> insert, negative -> delete
+
+    if diff == 0:
+        return 0
+
+    merges = save_merged_ranges(ws)
+    unmerge_all(ws, merges)
+
+    if diff > 0:
+        # Insert rows before footer
+        ws.insert_rows(footer_start, amount=diff)
+
+        # Copy style from last template body row (body_end) into inserted rows
+        # The "template body_end" is still the same row index since we inserted at footer_start.
+        # Inserted rows begin at footer_start and go footer_start + diff - 1
+        for r in range(footer_start, footer_start + diff):
+            copy_row_style(ws, src_row=body_end, dst_row=r, max_col=style_copy_width_cols)
+
+    else:
+        # Delete rows from bottom of body AFTER the area we need to keep
+        delete_count = abs(diff)
+        delete_start = body_start + needed_rows  # first row after needed body content
+        ws.delete_rows(delete_start, amount=delete_count)
+
+    # Restore merges, shifting anything at or below the original footer start
+    restore_merges(ws, merges, footer_start, diff)
+
+    return diff
+
+
+# =========================================================
+# Totals helpers
+# =========================================================
 def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
     if not items:
         return None
@@ -123,54 +270,10 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
             found = True
     return total if found else None
 
-def insert_logo(ws):
-    """
-    Reinserts logo at A1 every time.
-    Requires Pillow installed (pip install pillow).
-    """
-    if not os.path.exists(LOGO_PATH):
-        logging.warning(f"Logo not found at {LOGO_PATH}; skipping insert.")
-        return
 
-    img = XLImage(LOGO_PATH)
-    ws.add_image(img, "A1")
-
-
-def adjust_body_rows(ws, sign_count: int, body_start: int = 28, body_end: int = 47, extra_blank_rows: int = 3):
-    """
-    Ensures the body section has enough rows to fit:
-      sign_count + extra_blank_rows
-    Body is initially body_start..body_end (inclusive).
-    Footer begins at body_end + 1.
-    
-    If needed rows > base rows, inserts rows right before footer.
-    If needed rows < base rows, deletes rows from within the body so footer shifts up.
-    """
-    base_rows = body_end - body_start + 1
-    needed_rows = sign_count + extra_blank_rows
-
-    footer_start = body_end + 1
-    diff = needed_rows - base_rows
-
-    if diff > 0:
-        # Need more body rows: insert diff rows before footer
-        logging.info(f"Inserting {diff} rows at {footer_start} to expand body from {base_rows} to {needed_rows}.")
-        ws.insert_rows(footer_start, amount=diff)
-
-    elif diff < 0:
-        # Too many body rows: delete rows from the bottom part of the body
-        delete_count = abs(diff)
-        delete_start = body_start + needed_rows  # first row AFTER the needed body content
-        logging.info(f"Deleting {delete_count} rows at {delete_start} to shrink body from {base_rows} to {needed_rows}.")
-        ws.delete_rows(delete_start, amount=delete_count)
-
-    # If diff == 0, body is already correct size
-    return needed_rows
-
-
-# ---------------------------------------------------------
-# Health check
-# ---------------------------------------------------------
+# =========================================================
+# FastAPI endpoints
+# =========================================================
 @app.get("/")
 def root():
     return {
@@ -183,9 +286,6 @@ def root():
     }
 
 
-# ---------------------------------------------------------
-# Generate proposal (returns download URL)
-# ---------------------------------------------------------
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     logging.info("Incoming request: payload keys = %s", list(payload.keys()) if payload else None)
@@ -210,21 +310,17 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
 
-        # ✅ Ensure logo is present in output
+        # Reinsert logo (openpyxl may drop template images)
         insert_logo(ws)
 
-        # ---------------------------------------------------------
-        # Header / mapped fields
-        # ---------------------------------------------------------
+        # ---------------- Header mapping ----------------
         write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
         write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
         write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
         write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
         write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
 
-        # ---------------------------------------------------------
-        # Sold-to / Ship-to blocks
-        # ---------------------------------------------------------
+        # ---------------- Sold-to / Ship-to ----------------
         sold_to = estimate_data.get("sold_to", {}) or {}
         ship_to = estimate_data.get("ship_to", {}) or {}
 
@@ -248,11 +344,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         write_cell(ws, "C16", ship_csz)
         write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-        # ---------------------------------------------------------
-        # BODY RANGE RULES
-        # Body is rows 28..47 in the template (20 rows)
-        # Must fit sign_count + 3 blank lines
-        # ---------------------------------------------------------
+        # ---------------- Dynamic body resize (Option 2) ----------------
         sign_types = estimate_data.get("sign_types", []) or []
         sign_count = len(sign_types)
 
@@ -260,23 +352,23 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         BODY_END = 47
         EXTRA_BLANK = 3
 
-        needed_body_rows = adjust_body_rows(
+        footer_row_offset = adjust_body_rows_preserve_footer(
             ws,
             sign_count=sign_count,
             body_start=BODY_START,
             body_end=BODY_END,
-            extra_blank_rows=EXTRA_BLANK
+            extra_blank_rows=EXTRA_BLANK,
+            style_copy_width_cols=30
         )
 
-        # ---------------------------------------------------------
-        # Line items table (shift left): A-F
-        # ---------------------------------------------------------
+        # ---------------- Write sign lines ----------------
+        # Your left-shifted layout:
+        # Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
 
         current_row = BODY_START
         item_num = 1
 
-        # Write sign types
         for sign in sign_types:
             ws[f"{COL_ITEM}{current_row}"].value = item_num
 
@@ -295,61 +387,36 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             current_row += 1
             item_num += 1
 
-        # Ensure 3 blank lines after the last sign type
-        blank_rows_to_write = EXTRA_BLANK
-        for _ in range(blank_rows_to_write):
-            # Clear cells in the blank rows, just in case template had placeholders
+        # Ensure 3 blank rows after last sign
+        for _ in range(EXTRA_BLANK):
             for col in [COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL]:
                 ws[f"{col}{current_row}"].value = None
             current_row += 1
 
-        # (If the template body is larger than needed, adjust_body_rows already deleted extras)
-
-        # ---------------------------------------------------------
-        # Totals section
-        # ⚠️ NOTE: Totals cells may SHIFT if footer moved.
-        # Because we insert/delete rows ABOVE the footer, totals positions shift with the footer automatically.
-        # But the cell references (F48 etc.) are now no longer stable.
-        #
-        # ✅ Best practice: Anchor totals relative to the "SUBTOTAL" label cell.
-        # For now, if your totals are below the body, you should locate them by label.
-        # ---------------------------------------------------------
-
-        # --- FIND totals by label (recommended, stable) ---
-        def find_cell_with_text(ws, text: str):
-            text = text.strip().lower()
-            for row in ws.iter_rows():
-                for cell in row:
-                    if isinstance(cell.value, str) and cell.value.strip().lower() == text:
-                        return cell
-            return None
-
+        # ---------------- Totals (hard-coded cells shifted by footer offset) ----------------
         totals = estimate_data.get("totals", {}) or {}
         subtotal = safe_num(totals.get("sub_total"))
         grand_total = safe_num(totals.get("total"))
         shipping_total = sum_extended(estimate_data.get("shipping"))
         install_total = sum_extended(estimate_data.get("installation"))
 
-        # Example: label "Subtotal:" might be in column E and value in F. Adjust if needed.
-        subtotal_label = find_cell_with_text(ws, "subtotal:")
-        if subtotal_label and subtotal is not None:
-            ws.cell(row=subtotal_label.row, column=subtotal_label.column + 1).value = subtotal
+        # These were your stable references BEFORE we started inserting/deleting rows.
+        # Now we shift them by footer_row_offset.
+        SUBTOTAL_CELL = "F48"
+        SHIPPING_CELL = "F49"
+        INSTALL_CELL = "F53"
+        TOTAL_CELL = "F54"
 
-        shipping_label = find_cell_with_text(ws, "shipping:")
-        if shipping_label and shipping_total is not None:
-            ws.cell(row=shipping_label.row, column=shipping_label.column + 1).value = shipping_total
+        if subtotal is not None:
+            write_cell(ws, shift_cell_ref(SUBTOTAL_CELL, footer_row_offset), subtotal)
+        if shipping_total is not None:
+            write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_total)
+        if install_total is not None:
+            write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_total)
+        if grand_total is not None:
+            write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
-        installation_label = find_cell_with_text(ws, "installation:")
-        if installation_label and install_total is not None:
-            ws.cell(row=installation_label.row, column=installation_label.column + 1).value = install_total
-
-        total_label = find_cell_with_text(ws, "total:")
-        if total_label and grand_total is not None:
-            ws.cell(row=total_label.row, column=total_label.column + 1).value = grand_total
-
-        # ---------------------------------------------------------
-        # Save output workbook
-        # ---------------------------------------------------------
+        # ---------------- Save ----------------
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
@@ -376,5 +443,5 @@ def download_file(filename: str):
     return FileResponse(
         file_path,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=filename,
+        filename=filename
     )
