@@ -2,6 +2,8 @@ import os
 import uuid
 import json
 import logging
+import re
+import subprocess
 from typing import Dict, Any, List, Optional
 
 from fastapi import FastAPI, Body, HTTPException
@@ -16,6 +18,9 @@ SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 # Use /tmp for hosted environments
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# OPTIONAL: Set this in Railway variables to "true" to preserve header images better
+ENABLE_LIBREOFFICE_RESAVE = os.environ.get("ENABLE_LIBREOFFICE_RESAVE", "false").lower() == "true"
 
 app = FastAPI()
 
@@ -46,7 +51,6 @@ def summarize_components(components: List[Dict[str, Any]], max_lines: int = 4) -
     """
     if not components:
         return ""
-
     lines = []
     for c in components[:max_lines]:
         desc = safe_str(c.get("description")).strip()
@@ -71,39 +75,38 @@ def summarize_components(components: List[Dict[str, Any]], max_lines: int = 4) -
 
 def split_sign_type_and_summary(raw_sign_type: str):
     """
-    If sign_type is in the estimate format:
-        SIGN TYPE - SUMMARY
-    return:
-        (SIGN TYPE, SUMMARY)
-    Otherwise:
-        (raw_sign_type, "")
+    Handles:
+      'D - Donor Room'
+      'D- Donor Room'
+      'D-Donor Room'
+    => sign_type='D', summary='Donor Room'
+
+    Also supports codes like:
+      'A1 - Something'
+      'D2- Something'
+    => sign_type='A1', summary='Something'
     """
     if not raw_sign_type:
         return "", ""
 
-    raw_sign_type = raw_sign_type.strip()
+    s = raw_sign_type.strip()
 
-    # Best-case delimiter
-    if " - " in raw_sign_type:
-        left, right = raw_sign_type.split(" - ", 1)
-        return left.strip(), right.strip()
+    # Match a leading code (letters/numbers), optional spaces, dash, optional spaces, then summary
+    m = re.match(r"^([A-Za-z0-9]+)\s*-\s*(.+)$", s)
+    if m:
+        code = m.group(1).strip()
+        summary = m.group(2).strip()
+        return code, summary
 
-    # Fallback delimiter without spaces (use carefully)
-    if "-" in raw_sign_type:
-        left, right = raw_sign_type.split("-", 1)
-        # Only treat as split if it looks like "type - summary"
-        if len(left.strip()) > 2 and len(right.strip()) > 5:
-            return left.strip(), right.strip()
-
-    return raw_sign_type, ""
+    # If no dash split found, return as-is
+    return s, ""
 
 def build_sign_description(sign: Dict[str, Any]) -> str:
     """
     Description cell rules:
-    - First line: Summary from "SIGN TYPE - SUMMARY" if present
-      (otherwise use sign['description'])
-    - Then: any additional description (if not duplicate)
-    - Then: component bullets
+    - First line: summary extracted from sign_type if formatted "CODE - SUMMARY"
+    - Then: additional description (if not duplicate)
+    - Then: component bullet summary
     """
     raw_sign_type = safe_str(sign.get("sign_type"))
     _, summary_from_type = split_sign_type_and_summary(raw_sign_type)
@@ -115,13 +118,14 @@ def build_sign_description(sign: Dict[str, Any]) -> str:
 
     lines = []
 
-    # First line: summary from type if present, else base
+    # First line: summary (preferred)
     if summary_from_type:
         lines.append(summary_from_type)
-        # Add base if it adds something and isn't identical
+        # Add base if it adds value and isn't identical
         if base and base.lower() != summary_from_type.lower():
             lines.append(base)
     else:
+        # Otherwise, base description is the first line
         if base:
             lines.append(base)
 
@@ -143,6 +147,30 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
     return total if found else None
 
 
+def libreoffice_resave_xlsm(path: str):
+    """
+    OPTIONAL post-processing step that re-saves the file using LibreOffice.
+    This helps preserve header logos/images that openpyxl may drop.
+    Requires LibreOffice installed on Railway.
+    """
+    out_dir = os.path.dirname(path)
+    logging.info("LibreOffice re-save enabled. Re-saving file via soffice...")
+    subprocess.run(
+        [
+            "soffice",
+            "--headless",
+            "--nologo",
+            "--nolockcheck",
+            "--convert-to",
+            "xlsm",
+            "--outdir",
+            out_dir,
+            path,
+        ],
+        check=True,
+    )
+
+
 # ---------------------------------------------------------
 # Health check
 # ---------------------------------------------------------
@@ -152,7 +180,8 @@ def root():
         "status": "ok",
         "template_exists": os.path.exists(TEMPLATE_PATH),
         "template_path": TEMPLATE_PATH,
-        "sheet_name": SHEET_NAME
+        "sheet_name": SHEET_NAME,
+        "libreoffice_resave_enabled": ENABLE_LIBREOFFICE_RESAVE,
     }
 
 
@@ -192,34 +221,30 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
         write_cell(ws, "D11", safe_str(sold_to.get("name")))
         write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
-        sold_csz = " ".join([p for p in [
-            safe_str(sold_to.get("city")),
-            safe_str(sold_to.get("state")),
-            safe_str(sold_to.get("zip"))
-        ] if p.strip()])
+        sold_csz = " ".join(
+            [p for p in [safe_str(sold_to.get("city")), safe_str(sold_to.get("state")), safe_str(sold_to.get("zip"))] if p.strip()]
+        )
         write_cell(ws, "D16", sold_csz)
         write_cell(ws, "D17", safe_str(sold_to.get("phone")))
 
         write_cell(ws, "C11", safe_str(ship_to.get("name")))
         write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
-        ship_csz = " ".join([p for p in [
-            safe_str(ship_to.get("city")),
-            safe_str(ship_to.get("state")),
-            safe_str(ship_to.get("zip"))
-        ] if p.strip()])
+        ship_csz = " ".join(
+            [p for p in [safe_str(ship_to.get("city")), safe_str(ship_to.get("state")), safe_str(ship_to.get("zip"))] if p.strip()]
+        )
         write_cell(ws, "C16", ship_csz)
         write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-        # Line items (shift LEFT by 2 columns)
-        start_row = 27
+        # Line items
+        start_row = 28  # <-- requested
         current_row = start_row
 
-        # SHIFTED LEFT:
-        # Item=A, SignType=B, Description=C, Qty=D, UnitPrice=E, Total=F
+        # Shift LEFT mapping: Item=A, SignType=B, Desc=C, Qty=D, Unit=E, Total=F
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
 
         sign_types = estimate_data.get("sign_types", []) or []
         item_num = 1
+
         for sign in sign_types:
             ws[f"{COL_ITEM}{current_row}"].value = item_num
 
@@ -229,13 +254,16 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
             ws[f"{COL_DESC}{current_row}"].value = build_sign_description(sign)
             ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
-            ws[f"{COL_UNIT}{current_row}"].value = safe_num(sign.get("unit_price"))
+
+            unit_price = safe_num(sign.get("unit_price"))
+            ws[f"{COL_UNIT}{current_row}"].value = round(unit_price) if unit_price is not None else None
+
             ws[f"{COL_TOTAL}{current_row}"].value = safe_num(sign.get("extended_total"))
 
             current_row += 1
             item_num += 1
 
-        # Totals (shift LEFT by 2 columns from H -> F)
+        # Totals (shift LEFT)
         totals = estimate_data.get("totals", {}) or {}
         subtotal = safe_num(totals.get("sub_total"))
         grand_total = safe_num(totals.get("total"))
@@ -257,6 +285,10 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         out_name = f"Boyd_Proposal_{file_id}.xlsm"
         out_path = os.path.join(OUTPUT_DIR, out_name)
         wb.save(out_path)
+
+        # Optional LibreOffice re-save for preserving header/logo images
+        if ENABLE_LIBREOFFICE_RESAVE:
+            libreoffice_resave_xlsm(out_path)
 
     except Exception as e:
         logging.exception("Proposal generation failed")
