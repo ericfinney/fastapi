@@ -416,21 +416,37 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         current_row = BODY_START
         item_num = 1
 
+        # Track duplicates by sign code
+        sign_code_counts = {}
+
         for sign in sign_types:
             ws[f"{COL_ITEM}{current_row}"].value = item_num
 
             raw_type = safe_str(sign.get("sign_type"))
-            clean_type, _ = split_sign_type_and_summary(raw_type)
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
+            clean_type, summary = split_sign_type_and_summary(raw_type)
 
-            # ✅ Description shows only the summary
-            ws[f"{COL_DESC}{current_row}"].value = build_description_one_cell(sign)
+            # Count occurrences of this sign code
+            sign_code_counts.setdefault(clean_type, 0)
+            sign_code_counts[clean_type] += 1
+            occurrence = sign_code_counts[clean_type]
 
-            ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
+            # Build description summary (only summary used per your rule)
+            desc_summary = summary.strip() if summary else safe_str(sign.get("description")).strip()
 
+            if occurrence == 1:
+                # Normal row
+                ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
+                ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
+                ws[f"{COL_DESC}{current_row}"].value = desc_summary
+            else:
+                # Alternate row (2nd+)
+                ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
+                ws[f"{COL_QTY}{current_row}"].value = None
+                ws[f"{COL_DESC}{current_row}"].value = f"Alternate {desc_summary}"
+
+            # Unit price + total still filled in for alternates (unless you want them blank too)
             unit_price = safe_num(sign.get("unit_price"))
             ws[f"{COL_UNIT}{current_row}"].value = round(unit_price) if unit_price is not None else None
-
             ws[f"{COL_TOTAL}{current_row}"].value = safe_num(sign.get("extended_total"))
 
             current_row += 1
