@@ -438,17 +438,17 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
                 ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
                 ws[f"{COL_DESC}{current_row}"].value = desc_summary
+                ws[f"{COL_TOTAL}{current_row}"].value = safe_num(sign.get("extended_total"))
             else:
                 # Alternate row (2nd+)
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
                 ws[f"{COL_QTY}{current_row}"].value = None
-                ws[f"{COL_DESC}{current_row}"].value = f"Alternate {desc_summary}"
+                ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
+                ws[f"{COL_TOTAL}{current_row}"].value = None
 
             # Unit price + total still filled in for alternates (unless you want them blank too)
             unit_price = safe_num(sign.get("unit_price"))
             ws[f"{COL_UNIT}{current_row}"].value = round(unit_price) if unit_price is not None else None
-            ws[f"{COL_TOTAL}{current_row}"].value = safe_num(sign.get("extended_total"))
-
             current_row += 1
             item_num += 1
 
