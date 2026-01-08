@@ -506,6 +506,15 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         # ✅ Locking + Sheet protection (MUST be done after ws exists)
         # =========================================================
 
+        ws.protection.sheet = True
+        ws.protection.formatCells = False
+        ws.protection.formatColumns = False
+        ws.protection.formatRows = False
+        ws.protection.insertRows = False
+        ws.protection.deleteRows = False
+        ws.protection.selectLockedCells = False
+        ws.protection.selectUnlockedCells = True
+        
         # Default: cells are locked by default in Excel. We only unlock what should be editable.
         for r in range(BODY_START, BODY_START + total_body_rows_needed):
             unlock_cell(ws, f"B{r}")  # sign type
@@ -516,14 +525,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             # If you want to explicitly lock totals:
             lock_cell(ws, f"F{r}")
 
-        ws.protection.sheet = True
-        ws.protection.formatCells = False
-        ws.protection.formatColumns = False
-        ws.protection.formatRows = False
-        ws.protection.insertRows = False
-        ws.protection.deleteRows = False
-        ws.protection.selectLockedCells = False
-        ws.protection.selectUnlockedCells = True
+
 
         # Save output workbook
         file_id = uuid.uuid4().hex
