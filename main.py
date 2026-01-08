@@ -3,6 +3,7 @@ import uuid
 import json
 import logging
 import re
+import math
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -53,6 +54,13 @@ def insert_logo(ws):
     img = XLImage(LOGO_PATH)
     ws.add_image(img, "A1")
 
+def round_up_dollars(value):
+    if value is None:
+        return None
+    try:
+        return math.ceil(float(value))
+    except Exception:
+        return None
 
 # =========================================================
 # Footer row height capture/restore
@@ -489,7 +497,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
                 ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
                 ws[f"{COL_DESC}{current_row}"].value = desc_summary
-                ws[f"{COL_TOTAL}{current_row}"].value = safe_num(sign.get("extended_total"))
+                ws[f"{COL_TOTAL}{current_row}"].value = round_up_dollars(sign.get("extended_total"))
             else:
                 # Alternate row (2nd+)
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
@@ -498,7 +506,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_TOTAL}{current_row}"].value = None
 
             # Unit price + total still filled in for alternates (unless you want them blank too)
-            unit_price = safe_num(sign.get("unit_price"))
+            ws[f"{COL_UNIT}{current_row}"].value = round_up_dollars(sign.get("unit_price"))
             ws[f"{COL_UNIT}{current_row}"].value = round(unit_price) if unit_price is not None else None
             current_row += 1
             item_num += 1
