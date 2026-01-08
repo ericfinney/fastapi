@@ -443,6 +443,9 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         ws.protection.selectLockedCells = False
         ws.protection.selectUnlockedCells = True
 
+        # IMPORTANT: commit protection settings
+        ws.protection.enable()
+        
         # Save output workbook
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
