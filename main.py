@@ -35,13 +35,6 @@ def cleanup_old_generated_workbooks(
     filename_prefix: str = "Boyd_Proposal_",
     allowed_exts: Tuple[str, ...] = (".xlsx", ".xlsm"),
 ) -> None:
-    """
-    Deletes generated proposal files older than N minutes.
-    Safe-guards:
-      - Only deletes files starting with filename_prefix
-      - Only deletes allowed_exts
-      - Only deletes regular files
-    """
     if not os.path.isdir(directory):
         return
 
@@ -83,11 +76,6 @@ def safe_num(x):
         return None
 
 def round_up_dollars(value):
-    """
-    Always round UP to the next whole dollar.
-    12.00 -> 12
-    12.01 -> 13
-    """
     if value is None or value == "":
         return None
     try:
@@ -102,9 +90,6 @@ def write_cell(ws, cell: str, value):
     ws[cell].value = value
 
 def insert_logo(ws):
-    """
-    Reinserts logo at A1 every time. Pillow must be installed.
-    """
     if not os.path.exists(LOGO_PATH):
         logging.warning("Logo not found at %s; skipping insert.", LOGO_PATH)
         return
@@ -140,15 +125,9 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 # =========================================================
 # Sign type + summary split (ROBUST)
 # =========================================================
-
-# Handles: " - ", "- ", " -", "-", and also en/em dash.
 TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
 
 def looks_like_sign_code(code: str) -> bool:
-    """
-    Allow commas/spaces like: "E5.P&P, D/F"
-    Keep guardrails to avoid splitting normal sentences.
-    """
     if not code:
         return False
     c = code.strip()
@@ -204,8 +183,8 @@ def split_ref(ref: str):
 
 def shift_range_overlap_safe(a1_range: str, footer_start_row: int, row_offset: int) -> str:
     a, b = parse_range(a1_range)
-    a_col, a_row = split_ref(a)
-    b_col, b_row = split_ref(b)
+    _, a_row = split_ref(a)
+    _, b_row = split_ref(b)
 
     if a_row is None or b_row is None:
         return a1_range
@@ -357,7 +336,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
-    # ✅ delete old generated workbooks older than 30 minutes
+    # delete old generated workbooks older than 30 minutes
     cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
 
     try:
@@ -460,8 +439,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
                 ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
                 ws[f"{COL_DESC}{current_row}"].value = desc_summary
-
-                # ✅ round up unit + total
                 ws[f"{COL_UNIT}{current_row}"].value = round_up_dollars(sign.get("unit_price"))
                 ws[f"{COL_TOTAL}{current_row}"].value = round_up_dollars(sign.get("extended_total"))
             else:
@@ -474,27 +451,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             current_row += 1
             item_num += 1
 
-        # Totals (shifted)
-        totals = estimate_data.get("totals", {}) or {}
-        subtotal = safe_num(totals.get("sub_total"))
-        grand_total = safe_num(totals.get("total"))
-        shipping_total = sum_extended(estimate_data.get("shipping"))
-        install_total = sum_extended(estimate_data.get("installation"))
-
-        SUBTOTAL_CELL = "F48"
-        SHIPPING_CELL = "F49"
-        INSTALL_CELL = "F53"
-        TOTAL_CELL = "F54"
-
-        if subtotal is not None:
-            write_cell(ws, shift_cell_ref(SUBTOTAL_CELL, footer_row_offset), subtotal)
-        if shipping_total is not None:
-            write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_total)
-        if install_total is not None:
-            write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_total)
-        if grand_total is not None:
-            write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
-
         # Row height adjustment
         last_used_row = ws.max_row
         approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
@@ -503,29 +459,26 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
         # =========================================================
-        # ✅ Locking + Sheet protection (MUST be done after ws exists)
+        # ✅ Unlock B–E FIRST, then enable sheet protection
         # =========================================================
+        for r in range(BODY_START, BODY_START + total_body_rows_needed):
+            unlock_cell(ws, f"B{r}")  # Sign type
+            unlock_cell(ws, f"C{r}")  # Description
+            unlock_cell(ws, f"D{r}")  # Qty
+            unlock_cell(ws, f"E{r}")  # Unit price
+            lock_cell(ws, f"F{r}")    # Total stays locked
 
+        # Now protect sheet (selection allowed for unlocked cells)
         ws.protection.sheet = True
         ws.protection.formatCells = False
         ws.protection.formatColumns = False
         ws.protection.formatRows = False
         ws.protection.insertRows = False
         ws.protection.deleteRows = False
+
+        # ✅ Allow selecting ONLY unlocked cells (your B–E rows)
         ws.protection.selectLockedCells = False
         ws.protection.selectUnlockedCells = True
-        
-        # Default: cells are locked by default in Excel. We only unlock what should be editable.
-        for r in range(BODY_START, BODY_START + total_body_rows_needed):
-            unlock_cell(ws, f"B{r}")  # sign type
-            unlock_cell(ws, f"C{r}")  # description
-            unlock_cell(ws, f"D{r}")  # qty
-            unlock_cell(ws, f"E{r}")  # unit price (editable if you want it editable)
-            # keep totals locked; do nothing (locked by default)
-            # If you want to explicitly lock totals:
-            lock_cell(ws, f"F{r}")
-
-
 
         # Save output workbook
         file_id = uuid.uuid4().hex
