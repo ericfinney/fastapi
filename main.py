@@ -80,32 +80,83 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 # =========================================================
 # Sign type + summary split (ROBUST)
 # =========================================================
-def split_sign_type_and_summary(raw_sign_type: str):
+
+# Split on hyphen/en-dash/em-dash with optional surrounding whitespace.
+# Handles:
+#   "A1 - Room ID"
+#   "A1- Room ID"
+#   "A1 -Room ID"
+#   "E5.P&P, D/F - Double Sided 12 x 18 DOT, Post w/ Plate Mount"
+TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
+
+def looks_like_sign_code(code: str) -> bool:
+    """
+    Heuristic guardrail:
+    Accept a left-side token as a sign code if it looks like a compact code
+    used by estimators, including commas/slashes like "E5.P&P, D/F".
+
+    Allowed:
+      letters, numbers, dots, slashes, ampersands, underscores, commas, spaces
+
+    Additional guardrails:
+      - Must start with a letter/number
+      - Must contain at least one alphanumeric
+      - Reasonable length cap (avoid splitting normal sentences)
+    """
+    if not code:
+        return False
+
+    c = code.strip()
+    if not c:
+        return False
+
+    # length guardrail: codes are typically short-ish
+    if len(c) > 40:
+        return False
+
+    # must start with alnum
+    if not re.match(r"^[A-Za-z0-9]", c):
+        return False
+
+    # allowed characters set (note: includes comma and space)
+    if not re.match(r"^[A-Za-z0-9./&_ ,]+$", c):
+        return False
+
+    # must contain at least one alphanumeric (redundant, but safe)
+    if not re.search(r"[A-Za-z0-9]", c):
+        return False
+
+    return True
+
+
+def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
     """
     Split only on the FIRST dash used as CODE - SUMMARY separator.
 
-    Supports codes like:
+    Supports:
       D - Donor Room
       D- Donor Room
       E5.W - 12 x 18 DOT, Wall Mount
       E5.VA.P&P - Something
       A4.X - Exterior Utility Room ID
+      E5.P&P, D/F - Double Sided 12 x 18 DOT, Post w/ Plate Mount
 
-    Code allowed chars:
-      letters, numbers, dots, slashes, ampersands, underscores
+    Also tolerates missing spaces around the dash.
     """
     if not raw_sign_type:
         return "", ""
 
-    s = raw_sign_type.strip()
+    s = str(raw_sign_type).strip()
+    if not s:
+        return "", ""
 
-    parts = re.split(r"\s*-\s*", s, maxsplit=1)
+    parts = TYPE_DESC_SPLIT_RE.split(s, maxsplit=1)
     if len(parts) == 2:
         code = parts[0].strip()
         summary = parts[1].strip()
 
         # Guardrail: only treat as code if it looks like a sign code
-        if re.match(r"^[A-Za-z0-9./&_]+$", code):
+        if looks_like_sign_code(code):
             return code, summary
 
     return s, ""
