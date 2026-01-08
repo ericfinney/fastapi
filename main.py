@@ -272,28 +272,11 @@ def adjust_body_rows_preserve_footer(
 
 
 # =========================================================
-# Totals helpers
-# =========================================================
-def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
-    if not items:
-        return None
-    total = 0.0
-    found = False
-    for it in items:
-        val = safe_num(it.get("extended_total"))
-        if val is not None:
-            total += val
-            found = True
-    return total if found else None
-
-
-# =========================================================
 # Approximate Row Height "AutoFit"
 # =========================================================
 def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[str], min_height: float = 15.0):
     CHARS_PER_LINE = 60
     LINE_HEIGHT = 15
-
     for r in range(row_start, row_end + 1):
         max_lines = 1
         for col in text_cols:
@@ -314,21 +297,40 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
 
 
 # =========================================================
+# NEW: unlock merged-cell top-lefts that overlap B–E body rows
+# =========================================================
+def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
+    """
+    Excel uses the top-left cell of a merged range to determine locked/unlocked.
+    If body rows contain merged cells whose top-left is locked, selection gets blocked.
+    This unlocks:
+      - all B–E cells in body rows
+      - the top-left cell of any merged range overlapping body rows and columns B–E
+    """
+    # 1) Unlock B–E cells directly
+    for r in range(body_row_start, body_row_end + 1):
+        for col in ("B", "C", "D", "E"):
+            unlock_cell(ws, f"{col}{r}")
+        # keep totals locked
+        lock_cell(ws, f"F{r}")
+
+    # 2) Unlock top-left of merged ranges that intersect (rows body) and (cols B–E)
+    # B=2, E=5
+    for rng in ws.merged_cells.ranges:
+        min_row, max_row = rng.min_row, rng.max_row
+        min_col, max_col = rng.min_col, rng.max_col
+
+        rows_intersect = not (max_row < body_row_start or min_row > body_row_end)
+        cols_intersect = not (max_col < 2 or min_col > 5)
+
+        if rows_intersect and cols_intersect:
+            top_left = ws.cell(row=min_row, column=min_col)
+            top_left.protection = Protection(locked=False)
+
+
+# =========================================================
 # FastAPI endpoints
 # =========================================================
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "template_exists": os.path.exists(TEMPLATE_PATH),
-        "template_path": TEMPLATE_PATH,
-        "sheet_name": SHEET_NAME,
-        "logo_exists": os.path.exists(LOGO_PATH),
-        "logo_path": LOGO_PATH,
-        "output_dir": OUTPUT_DIR,
-    }
-
-
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     logging.info("Incoming request: payload keys = %s", list(payload.keys()) if payload else None)
@@ -336,7 +338,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
-    # delete old generated workbooks older than 30 minutes
     cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
 
     try:
@@ -358,7 +359,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
         insert_logo(ws)
 
-        # Capture template footer row heights BEFORE any insertion/deletion
         FOOTER_HEIGHT_START = 48
         FOOTER_HEIGHT_END = 120
         footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
@@ -370,31 +370,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
         write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
 
-        # Sold-to / Ship-to
-        sold_to = estimate_data.get("sold_to", {}) or {}
-        ship_to = estimate_data.get("ship_to", {}) or {}
-
-        write_cell(ws, "D11", safe_str(sold_to.get("name")))
-        write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
-        sold_csz = " ".join([p for p in [
-            safe_str(sold_to.get("city")),
-            safe_str(sold_to.get("state")),
-            safe_str(sold_to.get("zip"))
-        ] if p.strip()])
-        write_cell(ws, "D16", sold_csz)
-        write_cell(ws, "D17", safe_str(sold_to.get("phone")))
-
-        write_cell(ws, "C11", safe_str(ship_to.get("name")))
-        write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
-        ship_csz = " ".join([p for p in [
-            safe_str(ship_to.get("city")),
-            safe_str(ship_to.get("state")),
-            safe_str(ship_to.get("zip"))
-        ] if p.strip()])
-        write_cell(ws, "C16", ship_csz)
-        write_cell(ws, "C17", safe_str(ship_to.get("phone")))
-
-        # Dynamic body resize
+        # Body resize
         sign_types = estimate_data.get("sign_types", []) or []
         sign_count = len(sign_types)
 
@@ -410,21 +386,21 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             extra_blank_rows=EXTRA_BLANK
         )
 
-        # Clear body rows we will use
         total_body_rows_needed = sign_count + EXTRA_BLANK
+        body_row_end = BODY_START + total_body_rows_needed - 1
+
+        # Clear body rows we will use
         for r in range(BODY_START, BODY_START + total_body_rows_needed):
             for c in ["A", "B", "C", "D", "E", "F"]:
                 ws[f"{c}{r}"].value = None
 
         # Write sign lines
-        COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
         current_row = BODY_START
         item_num = 1
-
         sign_code_counts: Dict[str, int] = {}
 
         for sign in sign_types:
-            ws[f"{COL_ITEM}{current_row}"].value = item_num
+            ws[f"A{current_row}"].value = item_num
 
             raw_type = safe_str(sign.get("sign_type"))
             clean_type, summary = split_sign_type_and_summary(raw_type)
@@ -436,39 +412,26 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             desc_summary = summary.strip() if summary else safe_str(sign.get("description")).strip()
 
             if occurrence == 1:
-                ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
-                ws[f"{COL_QTY}{current_row}"].value = safe_num(sign.get("qty"))
-                ws[f"{COL_DESC}{current_row}"].value = desc_summary
-                ws[f"{COL_UNIT}{current_row}"].value = round_up_dollars(sign.get("unit_price"))
-                ws[f"{COL_TOTAL}{current_row}"].value = round_up_dollars(sign.get("extended_total"))
+                ws[f"B{current_row}"].value = clean_type
+                ws[f"D{current_row}"].value = safe_num(sign.get("qty"))
+                ws[f"C{current_row}"].value = desc_summary
+                ws[f"E{current_row}"].value = round_up_dollars(sign.get("unit_price"))
+                ws[f"F{current_row}"].value = round_up_dollars(sign.get("extended_total"))
             else:
-                ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-                ws[f"{COL_QTY}{current_row}"].value = None
-                ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
-                ws[f"{COL_UNIT}{current_row}"].value = round_up_dollars(sign.get("unit_price"))
-                ws[f"{COL_TOTAL}{current_row}"].value = None
+                ws[f"C{current_row}"].value = f"ALTERNATE {desc_summary}"
+                ws[f"E{current_row}"].value = round_up_dollars(sign.get("unit_price"))
 
             current_row += 1
             item_num += 1
 
-        # Row height adjustment
         last_used_row = ws.max_row
         approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
-
-        # Restore footer row heights
         restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
-        # =========================================================
-        # ✅ Unlock B–E FIRST, then enable sheet protection
-        # =========================================================
-        for r in range(BODY_START, BODY_START + total_body_rows_needed):
-            unlock_cell(ws, f"B{r}")  # Sign type
-            unlock_cell(ws, f"C{r}")  # Description
-            unlock_cell(ws, f"D{r}")  # Qty
-            unlock_cell(ws, f"E{r}")  # Unit price
-            lock_cell(ws, f"F{r}")    # Total stays locked
+        # ✅ Unlock selection properly (handles merged cells)
+        unlock_body_selection(ws, BODY_START, body_row_end)
 
-        # Now protect sheet (selection allowed for unlocked cells)
+        # ✅ Protect sheet AFTER unlocking
         ws.protection.sheet = True
         ws.protection.formatCells = False
         ws.protection.formatColumns = False
@@ -476,7 +439,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         ws.protection.insertRows = False
         ws.protection.deleteRows = False
 
-        # ✅ Allow selecting ONLY unlocked cells (your B–E rows)
+        # Safety net: allow selection anywhere; edits still blocked on locked cells.
         ws.protection.selectLockedCells = False
         ws.protection.selectUnlockedCells = True
 
