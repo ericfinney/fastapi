@@ -98,16 +98,6 @@ def insert_logo(ws):
 
 
 # =========================================================
-# Lock/Unlock helpers
-# =========================================================
-def lock_cell(ws, cell_ref: str):
-    ws[cell_ref].protection = Protection(locked=True)
-
-def unlock_cell(ws, cell_ref: str):
-    ws[cell_ref].protection = Protection(locked=False)
-
-
-# =========================================================
 # Footer row height capture/restore
 # =========================================================
 def capture_row_heights(ws, start_row: int, end_row: int) -> dict:
@@ -135,6 +125,7 @@ def looks_like_sign_code(code: str) -> bool:
         return False
     if not re.match(r"^[A-Za-z0-9]", c):
         return False
+    # allow commas/spaces (ex: "E5.P&P, D/F")
     if not re.match(r"^[A-Za-z0-9./&_ ,]+$", c):
         return False
     return True
@@ -147,6 +138,7 @@ def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
     if not s:
         return "", ""
 
+    # handles: "A1 - Room", "A1- Room", "A1 -Room", "A1-Room"
     parts = TYPE_DESC_SPLIT_RE.split(s, maxsplit=1)
     if len(parts) == 2:
         code = parts[0].strip()
@@ -297,35 +289,40 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
 
 
 # =========================================================
-# NEW: unlock merged-cell top-lefts that overlap B–E body rows
+# NEW: HARD-ENFORCE "only B–E body rows selectable"
 # =========================================================
-def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
+def lock_all_then_unlock_body(ws, body_row_start: int, body_row_end: int) -> None:
     """
-    Excel uses the top-left cell of a merged range to determine locked/unlocked.
-    If body rows contain merged cells whose top-left is locked, selection gets blocked.
-    This unlocks:
-      - all B–E cells in body rows
-      - the top-left cell of any merged range overlapping body rows and columns B–E
+    Selection policy:
+      - Lock every cell in the used range.
+      - Unlock ONLY B–E for body rows.
+    This guarantees Excel will treat only those cells as "unlocked",
+    so with selectLockedCells=False + selectUnlockedCells=True,
+    users can ONLY select/copy those cells.
     """
-    # 1) Unlock B–E cells directly
+    max_row = ws.max_row
+    max_col = ws.max_column
+
+    # 1) lock everything in the used range
+    locked = Protection(locked=True)
+    unlocked = Protection(locked=False)
+
+    for r in range(1, max_row + 1):
+        for c in range(1, max_col + 1):
+            ws.cell(row=r, column=c).protection = locked
+
+    # 2) unlock body B–E
+    # B=2, C=3, D=4, E=5
     for r in range(body_row_start, body_row_end + 1):
-        for col in ("B", "C", "D", "E"):
-            unlock_cell(ws, f"{col}{r}")
-        # keep totals locked
-        lock_cell(ws, f"F{r}")
+        for c in range(2, 6):
+            ws.cell(row=r, column=c).protection = unlocked
 
-    # 2) Unlock top-left of merged ranges that intersect (rows body) and (cols B–E)
-    # B=2, E=5
+    # 3) merged cells: unlock top-left if merged range intersects B–E body area
     for rng in ws.merged_cells.ranges:
-        min_row, max_row = rng.min_row, rng.max_row
-        min_col, max_col = rng.min_col, rng.max_col
-
-        rows_intersect = not (max_row < body_row_start or min_row > body_row_end)
-        cols_intersect = not (max_col < 2 or min_col > 5)
-
+        rows_intersect = not (rng.max_row < body_row_start or rng.min_row > body_row_end)
+        cols_intersect = not (rng.max_col < 2 or rng.min_col > 5)
         if rows_intersect and cols_intersect:
-            top_left = ws.cell(row=min_row, column=min_col)
-            top_left.protection = Protection(locked=False)
+            ws.cell(row=rng.min_row, column=rng.min_col).protection = unlocked
 
 
 # =========================================================
@@ -428,10 +425,12 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
         restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
-        # ✅ Unlock selection properly (handles merged cells)
-        unlock_body_selection(ws, BODY_START, body_row_end)
+        # =========================================================
+        # ✅ Enforce selection policy: ONLY B–E body rows selectable
+        # =========================================================
+        lock_all_then_unlock_body(ws, BODY_START, body_row_end)
 
-        # ✅ Protect sheet AFTER unlocking
+        # Protect sheet AFTER lock/unlock
         ws.protection.sheet = True
         ws.protection.formatCells = False
         ws.protection.formatColumns = False
@@ -439,13 +438,13 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         ws.protection.insertRows = False
         ws.protection.deleteRows = False
 
-        # Safety net: allow selection anywhere; edits still blocked on locked cells.
+        # ✅ Selection enforcement
         ws.protection.selectLockedCells = False
         ws.protection.selectUnlockedCells = True
 
         # IMPORTANT: commit protection settings
         ws.protection.enable()
-        
+
         # Save output workbook
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
