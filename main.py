@@ -420,8 +420,8 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     ws.protection.insertColumns = False
     ws.protection.deleteColumns = False
     
-    # Critical: Set password to empty string and enable protection
-    ws.protection.password = ''
+    # Set no password (critical - must be None, not empty string)
+    ws.protection.password = None
     
     logging.info("Enabling sheet protection")
     ws.protection.sheet = True
@@ -470,8 +470,10 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
         
-        # Disable any existing sheet protection from the template
+        # Completely remove any existing sheet protection from the template
         ws.protection.sheet = False
+        ws.protection.password = None
+        ws.protection.enable()  # Reset to default unprotected state
 
         insert_logo(ws)
 
