@@ -420,9 +420,7 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     ws.protection.insertColumns = False
     ws.protection.deleteColumns = False
     
-    # Set no password (critical - must be None, not empty string)
-    ws.protection.password = None
-    
+    # No password needed - just enable protection
     logging.info("Enabling sheet protection")
     ws.protection.sheet = True
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
@@ -471,8 +469,9 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         ws = wb[SHEET_NAME]
         
         # Completely remove any existing sheet protection from the template
-        ws.protection.sheet = False
-        ws.protection.password = None
+        # Create a fresh protection object with no password
+        from openpyxl.worksheet.protection import SheetProtection
+        ws.protection = SheetProtection()
 
         insert_logo(ws)
 
