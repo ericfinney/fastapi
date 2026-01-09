@@ -5,8 +5,12 @@ import logging
 import re
 import math
 import time
+import zipfile
+import tempfile
+import shutil
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
+from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -446,6 +450,92 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
         logging.info(f"AFTER protection - Cell {cell_ref} locked status: {locked}")
 
 
+def fix_sheet_protection_xml(xlsx_path: str, sheet_name: str = "Proposal"):
+    """
+    Post-process the Excel file to fix sheet protection XML.
+    openpyxl doesn't save selectLockedCells/selectUnlockedCells correctly,
+    so we manually edit the XML.
+    """
+    # Create a temp directory to extract the xlsx
+    temp_dir = tempfile.mkdtemp()
+    
+    try:
+        # Extract the xlsx (it's just a zip file)
+        with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        # Find the sheet XML file (usually xl/worksheets/sheet1.xml)
+        # We need to find which sheet number corresponds to our sheet name
+        workbook_xml = os.path.join(temp_dir, 'xl', 'workbook.xml')
+        tree = ET.parse(workbook_xml)
+        root = tree.getroot()
+        
+        # Find sheet ID for our sheet name
+        ns = {'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
+        sheet_id = None
+        for sheet in root.findall('.//main:sheet', ns):
+            if sheet.get('name') == sheet_name:
+                # Get the rId and find corresponding sheet file
+                sheet_id = sheet.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                break
+        
+        if not sheet_id:
+            logging.warning(f"Could not find sheet '{sheet_name}' in workbook XML")
+            return
+        
+        # Parse the rels file to find the actual sheet file
+        rels_file = os.path.join(temp_dir, 'xl', '_rels', 'workbook.xml.rels')
+        rels_tree = ET.parse(rels_file)
+        rels_root = rels_tree.getroot()
+        
+        sheet_file = None
+        rels_ns = {'rel': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+        for rel in rels_root.findall('.//rel:Relationship', rels_ns):
+            if rel.get('Id') == sheet_id:
+                sheet_file = rel.get('Target')
+                break
+        
+        if not sheet_file:
+            logging.warning(f"Could not find sheet file for sheet ID '{sheet_id}'")
+            return
+        
+        # Now edit the sheet XML
+        sheet_xml_path = os.path.join(temp_dir, 'xl', sheet_file)
+        sheet_tree = ET.parse(sheet_xml_path)
+        sheet_root = sheet_tree.getroot()
+        
+        # Find or create the sheetProtection element
+        protection = sheet_root.find('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheetProtection')
+        
+        if protection is not None:
+            # Update the attributes
+            protection.set('selectLockedCells', '0')  # False = 0
+            protection.set('selectUnlockedCells', '1')  # True = 1
+            logging.info("Updated sheetProtection XML attributes")
+            
+            # Write back the modified XML
+            sheet_tree.write(sheet_xml_path, encoding='utf-8', xml_declaration=True)
+            
+            # Re-zip everything back into the xlsx
+            with zipfile.ZipFile(xlsx_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
+                for root_dir, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root_dir, file)
+                        arc_name = os.path.relpath(file_path, temp_dir)
+                        zip_ref.write(file_path, arc_name)
+            
+            logging.info(f"Successfully fixed sheet protection XML in {xlsx_path}")
+        else:
+            logging.warning("No sheetProtection element found in XML")
+    
+    except Exception as e:
+        logging.error(f"Failed to fix sheet protection XML: {e}")
+    
+    finally:
+        # Clean up temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 # =========================================================
 # FastAPI endpoints
 # =========================================================
@@ -631,6 +721,10 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
         wb.save(out_path)
+        
+        # Post-process: Fix the sheet protection XML
+        logging.info("Post-processing: fixing sheet protection XML")
+        fix_sheet_protection_xml(out_path, SHEET_NAME)
 
     except Exception as e:
         logging.exception("Proposal generation failed")
