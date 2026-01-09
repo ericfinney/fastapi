@@ -411,38 +411,13 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
         locked = ws[cell_ref].protection.locked
         logging.info(f"BEFORE protection - Cell {cell_ref} locked status: {locked}")
 
-    # Set all protection settings BEFORE enabling sheet protection
-    # This order matters for openpyxl to save them correctly
-    ws.protection.formatCells = False
-    ws.protection.formatColumns = False
-    ws.protection.formatRows = False
-    ws.protection.insertRows = False
-    ws.protection.deleteRows = False
-    ws.protection.insertColumns = False
-    ws.protection.deleteColumns = False
-    
-    # Try both the Python attribute names AND the XML attribute names
-    # selectLockedCells in XML might need to be set differently
-    ws.protection.selectLockedCells = False
-    ws.protection.selectUnlockedCells = True
-    
-    # Also try setting the underlying attributes directly
-    ws.protection._selectLockedCells = False
-    ws.protection._selectUnlockedCells = True
-    
-    # Now enable sheet protection - this must be LAST
+    # DON'T set selectLockedCells or selectUnlockedCells - preserve template settings
+    # Just re-enable sheet protection
+    logging.info("Re-enabling sheet protection (preserving template EnableSelection setting)")
     ws.protection.sheet = True
     
-    logging.info("Sheet protection enabled")
-    
-    # Verify protection settings - check both regular and underscore versions
+    # Verify protection settings
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
-    logging.info(f"Select locked cells: {ws.protection.selectLockedCells}")
-    logging.info(f"Select unlocked cells: {ws.protection.selectUnlockedCells}")
-    if hasattr(ws.protection, '_selectLockedCells'):
-        logging.info(f"_selectLockedCells: {ws.protection._selectLockedCells}")
-    if hasattr(ws.protection, '_selectUnlockedCells'):
-        logging.info(f"_selectUnlockedCells: {ws.protection._selectUnlockedCells}")
     
     # Verify cells are STILL unlocked after enabling protection
     for cell_ref in test_cells:
