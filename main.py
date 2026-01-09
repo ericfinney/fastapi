@@ -417,19 +417,28 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     ws.protection.insertColumns = False
     ws.protection.deleteColumns = False
     
-    # CRITICAL: Set these BEFORE sheet=True
+    # Try both the Python attribute names AND the XML attribute names
+    # selectLockedCells in XML might need to be set differently
     ws.protection.selectLockedCells = False
     ws.protection.selectUnlockedCells = True
+    
+    # Also try setting the underlying attributes directly
+    ws.protection._selectLockedCells = False
+    ws.protection._selectUnlockedCells = True
     
     # Now enable sheet protection - this must be LAST
     ws.protection.sheet = True
     
     logging.info("Sheet protection enabled")
     
-    # Verify protection settings
+    # Verify protection settings - check both regular and underscore versions
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
     logging.info(f"Select locked cells: {ws.protection.selectLockedCells}")
     logging.info(f"Select unlocked cells: {ws.protection.selectUnlockedCells}")
+    if hasattr(ws.protection, '_selectLockedCells'):
+        logging.info(f"_selectLockedCells: {ws.protection._selectLockedCells}")
+    if hasattr(ws.protection, '_selectUnlockedCells'):
+        logging.info(f"_selectUnlockedCells: {ws.protection._selectUnlockedCells}")
     
     # Verify cells are STILL unlocked after enabling protection
     for cell_ref in test_cells:
