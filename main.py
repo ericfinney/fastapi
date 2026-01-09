@@ -401,11 +401,11 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     logging.info(f"Unlocking body cells B-E in rows {body_row_start}-{body_row_end}")
     unlock_body_selection(ws, body_row_start, body_row_end)
     
-    # Verify a few cells are actually unlocked
-    test_cells = [f"B{body_row_start}", f"C{body_row_start}", f"D{body_row_start}", f"E{body_row_start}"]
+    # Verify a few cells are actually unlocked BEFORE enabling protection
+    test_cells = [f"B{body_row_start}", f"C{body_row_start}", f"D{body_row_start}", f"E{body_row_start}", f"A{body_row_start}", f"F{body_row_start}"]
     for cell_ref in test_cells:
         locked = ws[cell_ref].protection.locked
-        logging.info(f"Cell {cell_ref} locked status: {locked}")
+        logging.info(f"BEFORE protection - Cell {cell_ref} locked status: {locked}")
 
     # Prevent selecting locked cells, allow selecting unlocked cells
     ws.protection.selectLockedCells = False
@@ -423,7 +423,16 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     # No password needed - just enable protection
     logging.info("Enabling sheet protection")
     ws.protection.sheet = True
+    
+    # Verify protection settings
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
+    logging.info(f"Select locked cells: {ws.protection.selectLockedCells}")
+    logging.info(f"Select unlocked cells: {ws.protection.selectUnlockedCells}")
+    
+    # Verify cells are STILL unlocked after enabling protection
+    for cell_ref in test_cells:
+        locked = ws[cell_ref].protection.locked
+        logging.info(f"AFTER protection - Cell {cell_ref} locked status: {locked}")
 
 
 # =========================================================
