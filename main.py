@@ -508,10 +508,16 @@ def fix_sheet_protection_xml(xlsx_path: str, sheet_name: str = "Proposal"):
         protection = sheet_root.find('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheetProtection')
         
         if protection is not None:
-            # Update the attributes
-            protection.set('selectLockedCells', '0')  # False = 0
-            protection.set('selectUnlockedCells', '1')  # True = 1
-            logging.info("Updated sheetProtection XML attributes")
+            # Remove selectLockedCells attribute if it exists
+            if 'selectLockedCells' in protection.attrib:
+                del protection.attrib['selectLockedCells']
+            
+            # Set selectUnlockedCells to true
+            # According to Excel XML spec, omitting selectLockedCells means False
+            # Setting selectUnlockedCells to 1 means True
+            protection.set('selectUnlockedCells', '1')
+            
+            logging.info("Updated sheetProtection XML: removed selectLockedCells, set selectUnlockedCells=1")
             
             # Write back the modified XML
             sheet_tree.write(sheet_xml_path, encoding='utf-8', xml_declaration=True)
