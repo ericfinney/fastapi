@@ -407,11 +407,8 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
         locked = ws[cell_ref].protection.locked
         logging.info(f"BEFORE protection - Cell {cell_ref} locked status: {locked}")
 
-    # Prevent selecting locked cells, allow selecting unlocked cells
-    ws.protection.selectLockedCells = False
-    ws.protection.selectUnlockedCells = True
-
-    # Optional hardening
+    # Set all protection settings BEFORE enabling sheet protection
+    # This order matters for openpyxl to save them correctly
     ws.protection.formatCells = False
     ws.protection.formatColumns = False
     ws.protection.formatRows = False
@@ -420,9 +417,14 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     ws.protection.insertColumns = False
     ws.protection.deleteColumns = False
     
-    # Enable protection with no password using the enable() method
-    logging.info("Enabling sheet protection with enable() method")
-    ws.protection.enable()
+    # CRITICAL: Set these BEFORE sheet=True
+    ws.protection.selectLockedCells = False
+    ws.protection.selectUnlockedCells = True
+    
+    # Now enable sheet protection - this must be LAST
+    ws.protection.sheet = True
+    
+    logging.info("Sheet protection enabled")
     
     # Verify protection settings
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
