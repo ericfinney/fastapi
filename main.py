@@ -660,7 +660,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
         # ---------------- Totals (hard-coded cells shifted) ----------------
         totals = estimate_data.get("totals", {}) or {}
-        subtotal = safe_num(totals.get("sub_total"))
         grand_total = safe_num(totals.get("total"))
         shipping_total = sum_extended(estimate_data.get("shipping"))
         install_total = sum_extended(estimate_data.get("installation"))
@@ -670,12 +669,20 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         INSTALL_CELL = "F53"
         TOTAL_CELL = "F54"
 
-        if subtotal is not None:
-            write_cell(ws, shift_cell_ref(SUBTOTAL_CELL, footer_row_offset), subtotal)
-        if shipping_total is not None:
-            write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_total)
-        if install_total is not None:
-            write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_total)
+        # Subtotal: Use SUM formula for all body rows in column F
+        subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
+        body_sum_range = f"F{BODY_START}:F{body_last_row}"
+        ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
+        
+        # Shipping: default to 0.00 if None or zero
+        shipping_value = shipping_total if shipping_total else 0.00
+        write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_value)
+        
+        # Installation: default to 0.00 if None or zero
+        install_value = install_total if install_total else 0.00
+        write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_value)
+        
+        # Grand total
         if grand_total is not None:
             write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
