@@ -99,6 +99,19 @@ def round_up_dollars(value):
     except Exception:
         return None
 
+def round_nearest_dollar(value):
+    """
+    Round to nearest whole dollar using standard rounding.
+    12.49 -> 12
+    12.50 -> 13
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return round(float(value))
+    except Exception:
+        return None
+
 def join_address_lines(addr_lines: List[str]) -> str:
     return "\n".join([line for line in addr_lines if line and line.strip()])
 
@@ -655,7 +668,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             if occurrence == 1:
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
                 qty_val = safe_num(sign.get("qty"))
-                unit_val = round_up_dollars(sign.get("unit_price"))
+                unit_val = round_nearest_dollar(sign.get("unit_price"))
                 ws[f"{COL_QTY}{current_row}"].value = qty_val
                 ws[f"{COL_DESC}{current_row}"].value = desc_summary
                 ws[f"{COL_UNIT}{current_row}"].value = unit_val
@@ -668,7 +681,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
                 ws[f"{COL_QTY}{current_row}"].value = None
                 ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
-                unit_val = round_up_dollars(sign.get("unit_price"))
+                unit_val = round_nearest_dollar(sign.get("unit_price"))
                 ws[f"{COL_UNIT}{current_row}"].value = unit_val
                 # No total for alternates
                 ws[f"{COL_TOTAL}{current_row}"].value = None
