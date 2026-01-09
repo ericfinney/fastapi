@@ -408,21 +408,18 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
         logging.info(f"BEFORE protection - Cell {cell_ref} locked status: {locked}")
 
     # Prevent selecting locked cells, allow selecting unlocked cells
-    ws.protection.selectLockedCells = False
-    ws.protection.selectUnlockedCells = True
-
-    # Optional hardening (doesn't matter much since you don't care about edits, but safe)
-    ws.protection.formatCells = False
-    ws.protection.formatColumns = False
-    ws.protection.formatRows = False
-    ws.protection.insertRows = False
-    ws.protection.deleteRows = False
-    ws.protection.insertColumns = False
-    ws.protection.deleteColumns = False
-    
-    # No password needed - just enable protection
-    logging.info("Enabling sheet protection")
-    ws.protection.sheet = True
+    ws.protection.set(
+        sheet=True,
+        selectLockedCells=False,
+        selectUnlockedCells=True,
+        formatCells=False,
+        formatColumns=False,
+        formatRows=False,
+        insertRows=False,
+        deleteRows=False,
+        insertColumns=False,
+        deleteColumns=False
+    )
     
     # Verify protection settings
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
