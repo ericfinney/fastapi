@@ -272,7 +272,8 @@ def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
         dst.border = copy(src.border)
         dst.fill = copy(src.fill)
         dst.font = copy(src.font)
-        dst.protection = copy(src.protection)
+        # Don't copy protection - we'll set it explicitly later
+        # dst.protection = copy(src.protection)
 
 
 # =========================================================
@@ -507,11 +508,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
         total_body_rows_needed = sign_count + EXTRA_BLANK
         body_last_row = BODY_START + total_body_rows_needed - 1
-
-        # Clear the body rows we will use
-        for r in range(BODY_START, BODY_START + total_body_rows_needed):
-            for c in ["A", "B", "C", "D", "E", "F"]:
-                ws[f"{c}{r}"].value = None
 
         # ---------------- Write sign lines ----------------
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
