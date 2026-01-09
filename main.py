@@ -398,11 +398,10 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     unlock_body_selection(ws, body_row_start, body_row_end)
 
     # Enable protection + selection rules
-    ws.protection.sheet = True
-    ws.protection.enable()
+
 
     # Prevent selecting locked cells, allow selecting unlocked cells
-    ws.protection.selectLockedCells = True
+    ws.protection.selectLockedCells = False
     ws.protection.selectUnlockedCells = True
 
     # Optional hardening (doesn't matter much since you don't care about edits, but safe)
@@ -411,7 +410,7 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     ws.protection.formatRows = False
     ws.protection.insertRows = False
     ws.protection.deleteRows = False
-
+    ws.protection.enable()
 
 # =========================================================
 # FastAPI endpoints
