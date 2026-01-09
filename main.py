@@ -389,13 +389,23 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     Locks everything, unlocks only B–E body cells, then enables sheet protection
     so ONLY those unlocked cells are selectable.
     """
+    logging.info(f"Applying sheet protection for body rows {body_row_start} to {body_row_end}")
+    
     # Lock everything in the used region
     max_row = max(ws.max_row, body_row_end + 5)
     max_col = max(ws.max_column, 6)  # at least A–F
+    logging.info(f"Locking all cells up to row {max_row}, col {max_col}")
     lock_all_cells(ws, max_row=max_row, max_col=max_col)
 
     # Unlock the allowed body selection area (and merged top-lefts)
+    logging.info(f"Unlocking body cells B-E in rows {body_row_start}-{body_row_end}")
     unlock_body_selection(ws, body_row_start, body_row_end)
+    
+    # Verify a few cells are actually unlocked
+    test_cells = [f"B{body_row_start}", f"C{body_row_start}", f"D{body_row_start}", f"E{body_row_start}"]
+    for cell_ref in test_cells:
+        locked = ws[cell_ref].protection.locked
+        logging.info(f"Cell {cell_ref} locked status: {locked}")
 
     # Prevent selecting locked cells, allow selecting unlocked cells
     ws.protection.selectLockedCells = False
@@ -407,7 +417,10 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     ws.protection.formatRows = False
     ws.protection.insertRows = False
     ws.protection.deleteRows = False
+    
+    logging.info("Enabling sheet protection")
     ws.protection.enable()
+    logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
 
 
 # =========================================================
@@ -451,6 +464,9 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         if SHEET_NAME not in wb.sheetnames:
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
+        
+        # Disable any existing sheet protection from the template
+        ws.protection.sheet = False
 
         insert_logo(ws)
 
