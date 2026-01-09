@@ -584,10 +584,11 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
         
-        # Completely remove any existing sheet protection from the template
-        # Create a fresh protection object with no password
-        from openpyxl.worksheet.protection import SheetProtection
-        ws.protection = SheetProtection()
+        # DON'T replace the protection object - just disable it temporarily
+        # The template has the correct EnableSelection setting we want to preserve
+        ws.protection.sheet = False
+        
+        logging.info("Disabled template sheet protection (preserving settings)")
 
         insert_logo(ws)
 
@@ -727,10 +728,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
         wb.save(out_path)
-        
-        # Post-process: Fix the sheet protection XML
-        logging.info("Post-processing: fixing sheet protection XML")
-        fix_sheet_protection_xml(out_path, SHEET_NAME)
 
     except Exception as e:
         logging.exception("Proposal generation failed")
