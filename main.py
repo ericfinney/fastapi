@@ -473,7 +473,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         # Completely remove any existing sheet protection from the template
         ws.protection.sheet = False
         ws.protection.password = None
-        ws.protection.enable()  # Reset to default unprotected state
 
         insert_logo(ws)
 
