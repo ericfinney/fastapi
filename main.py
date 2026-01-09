@@ -417,9 +417,14 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     ws.protection.formatRows = False
     ws.protection.insertRows = False
     ws.protection.deleteRows = False
+    ws.protection.insertColumns = False
+    ws.protection.deleteColumns = False
+    
+    # Critical: Set password to empty string and enable protection
+    ws.protection.password = ''
     
     logging.info("Enabling sheet protection")
-    ws.protection.enable()
+    ws.protection.sheet = True
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
 
 
@@ -596,7 +601,10 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
         # ---------------- Selection rules (ONLY allow selecting B–E in body) ----------------
+        # CRITICAL: Must be the VERY LAST thing before saving - don't touch any cells after this!
         apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
+        
+        logging.info("About to save workbook - no more cell modifications after this point")
 
         # ---------------- Save output workbook ----------------
         file_id = uuid.uuid4().hex
