@@ -369,7 +369,7 @@ def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
     for r in range(body_row_start, body_row_end + 1):
         for col in ("B", "C", "D", "E"):
             unlock_cell(ws, f"{col}{r}")
-        lock_cell(ws, f"F{r}")  # keep totals locked in body
+        #lock_cell(ws, f"F{r}")  # keep totals locked in body
 
     # 2) Unlock top-left of merged ranges that intersect (rows body) and (cols B–E)
     # B=2, E=5
@@ -390,9 +390,9 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
     so ONLY those unlocked cells are selectable.
     """
     # Lock everything in the used region
-    max_row = max(ws.max_row, body_row_end + 5)
-    max_col = max(ws.max_column, 6)  # at least A–F
-    lock_all_cells(ws, max_row=max_row, max_col=max_col)
+    #max_row = max(ws.max_row, body_row_end + 5)
+    #max_col = max(ws.max_column, 6)  # at least A–F
+    #lock_all_cells(ws, max_row=max_row, max_col=max_col)
 
     # Unlock the allowed body selection area (and merged top-lefts)
     unlock_body_selection(ws, body_row_start, body_row_end)
@@ -547,7 +547,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_QTY}{current_row}"].value = None
                 ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
                 ws[f"{COL_TOTAL}{current_row}"].value = None
-                ws[f"{COL_UNIT}{current_row}"].value = None
+                ws[f"{COL_UNIT}{current_row}"].value = round_up_dollars(sign.get("unit_price"))
 
             current_row += 1
             item_num += 1
