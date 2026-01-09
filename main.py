@@ -296,6 +296,7 @@ def adjust_body_rows_preserve_footer(
     diff = needed_rows - base_rows
 
     if diff == 0:
+        write_cell(ws, "H3", "No Size Change")
         return 0
 
     merges = save_merged_ranges(ws)
@@ -305,6 +306,7 @@ def adjust_body_rows_preserve_footer(
 
     if diff > 0:
         logging.info("Inserting %d row(s) at %d to expand body.", diff, footer_start)
+        write_cell(ws, "H3", "Inserting %d row(s).", diff)
         ws.insert_rows(footer_start, amount=diff)
         for r in range(footer_start, footer_start + diff):
             copy_row_style(ws, src_row=body_end, dst_row=r, max_col=max_col)
@@ -312,6 +314,7 @@ def adjust_body_rows_preserve_footer(
         delete_count = abs(diff)
         delete_start = body_start + needed_rows
         logging.info("Deleting %d row(s) at %d to shrink body.", delete_count, delete_start)
+        write_cell(ws, "H3", "Deleted %d row(s).", delete_count)
         ws.delete_rows(delete_start, amount=delete_count)
 
     restore_merges(ws, merges, footer_start, diff)
