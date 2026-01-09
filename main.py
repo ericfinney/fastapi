@@ -634,12 +634,12 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
         total_body_rows_needed = sign_count + EXTRA_BLANK
         body_last_row = BODY_START + total_body_rows_needed - 1
-
+        body_change_count = footer_row_offset - 5
         # Add body change indicator in H3
-        if footer_row_offset > 0:
-            change_text = f"Add {footer_row_offset}"
-        elif footer_row_offset < 0:
-            change_text = f"Subtract {abs(footer_row_offset)}"
+        if body_change_count > 0:
+            change_text = f"Add {body_change_count}"
+        elif body_change_count < 0:
+            change_text = f"Subtract {body_change_count}"
         else:
             change_text = "No Change"
         ws["H3"].value = change_text
