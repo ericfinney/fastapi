@@ -891,7 +891,7 @@ def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
     saved_bytes = 0
     idx = int(req.start_index)
 
-    for chunk in req.b64s:
+    for chunk in req.chunks:
         # Whitespace-safe: strip any accidental newlines/spaces/tabs.
         clean_b64 = re.sub(r"\s+", "", chunk or "")
         if not clean_b64:
@@ -913,7 +913,7 @@ def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
     return {
         "ok": True,
         "saved_start_index": int(req.start_index),
-        "saved_count": len(req.b64s),
+        "saved_count": len(req.chunks),
         "saved_bytes": saved_bytes,
     }
 
@@ -968,7 +968,12 @@ def upload_chunk_alias(req: UploadChunkRequestModel):
 
 @app.post("/upload/chunk_batch", response_model=UploadChunkBatchResponseModel)
 def upload_chunk_batch_alias(req: UploadChunkBatchRequestModel):
-    return pdf_upload_chunk_batch(req)
+    try:
+        return pdf_upload_chunk_batch(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"chunk_batch failed: {e}")
 
 
 
