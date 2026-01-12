@@ -1,5 +1,6 @@
 import os
 import uuid
+import base64
 import json
 import logging
 import re
@@ -42,6 +43,11 @@ class PdfUrlRequest(BaseModel):
     file_url: str
 
 
+class PdfBase64Request(BaseModel):
+    filename: str
+    content_base64: str
+
+
 async def _download_pdf_bytes(file_url: str) -> bytes:
     """
     Downloads a PDF from a URL and returns raw bytes.
@@ -78,6 +84,24 @@ async def _download_pdf_bytes(file_url: str) -> bytes:
     except httpx.RequestError as e:
         raise HTTPException(status_code=400, detail=f"Failed to download file_url (network): {str(e)}")
 
+
+
+def _decode_pdf_base64(filename: str, content_base64: str) -> bytes:
+    """Decode a base64-encoded PDF and return raw bytes."""
+    if not content_base64 or not isinstance(content_base64, str):
+        raise HTTPException(status_code=400, detail="content_base64 must be a non-empty string")
+    try:
+        pdf_bytes = base64.b64decode(content_base64, validate=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
+
+    if not pdf_bytes or len(pdf_bytes) < 1000:
+        raise HTTPException(status_code=400, detail="Decoded file appears empty or invalid")
+    if not pdf_bytes.startswith(b"%PDF"):
+        # Some PDFs may have leading whitespace/newlines; be a bit lenient
+        if not pdf_bytes.lstrip().startswith(b"%PDF"):
+            raise HTTPException(status_code=400, detail="Decoded bytes do not appear to be a PDF")
+    return pdf_bytes
 
 # =========================================================
 # PDF EXTRACTION CLASSES (from extract_estimate_data.py)
@@ -692,6 +716,31 @@ async def convert_pdf(file: UploadFile = File(...)):
             pass
 
 
+@app.post("/convert-pdf-base64")
+async def convert_pdf_base64(req: PdfBase64Request):
+    """Extract JSON data from a base64-encoded PDF."""
+    pdf_bytes = _decode_pdf_base64(req.filename, req.content_base64)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(pdf_bytes)
+        tmp_path = tmp_file.name
+
+    try:
+        extractor = EstimateExtractor(tmp_path)
+        extractor.process_pdf()
+        json_data = extractor.to_json_format()
+        logging.info(f"Extracted {len(json_data['sign_types'])} sign items from PDF (base64)")
+        return JSONResponse({"success": True, "data": json_data})
+    except Exception as e:
+        logging.exception("Base64 PDF extraction failed")
+        raise HTTPException(status_code=500, detail=f"Base64 PDF extraction failed: {str(e)}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
 # =========================================================
 # NEW: URL-based PDF extraction endpoint (JSON only)
 # =========================================================
@@ -759,6 +808,36 @@ async def pdf_to_excel(file: UploadFile = File(...)):
     except Exception as e:
         logging.exception("PDF to Excel conversion failed")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+# =========================================================
+# NEW: Combined endpoint - PDF base64 -> Excel in one call
+# =========================================================
+@app.post("/pdf-to-excel-base64")
+async def pdf_to_excel_base64(req: PdfBase64Request):
+    """Convert a base64-encoded PDF to Excel in one call (best for GPT Actions)."""
+    cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
+
+    pdf_bytes = _decode_pdf_base64(req.filename, req.content_base64)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        tmp_file.write(pdf_bytes)
+        tmp_path = tmp_file.name
+
+    try:
+        extractor = EstimateExtractor(tmp_path)
+        extractor.process_pdf()
+        estimate_data = extractor.to_json_format()
+        logging.info(f"Extracted {len(estimate_data['sign_types'])} sign items from PDF (base64)")
+        return _generate_excel_from_data(estimate_data)
+    except Exception as e:
+        logging.exception("Base64 PDF to Excel conversion failed")
+        raise HTTPException(status_code=500, detail=f"Base64 conversion failed: {str(e)}")
     finally:
         try:
             os.unlink(tmp_path)
@@ -992,8 +1071,10 @@ def root():
         "service": "Boyd Sign Systems - Estimate Processor",
         "endpoints": {
             "/convert-pdf": "POST - Upload PDF, get JSON data",
+            "/convert-pdf-base64": "POST - Send {filename, content_base64}, get JSON data",
             "/convert-pdf-url": "POST - Send {file_url}, get JSON data",
             "/pdf-to-excel": "POST - Upload PDF, get Excel file directly",
+            "/pdf-to-excel-base64": "POST - Send {filename, content_base64}, get Excel file directly",
             "/pdf-to-excel-url": "POST - Send {file_url}, get Excel file directly",
             "/generate-proposal": "POST - Send JSON data, get Excel file"
         }
