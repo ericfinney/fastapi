@@ -32,7 +32,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
 
-APP_VERSION = "v4-base64-tolerant"
+APP_VERSION = "v5-status-and-missing-helpers"
 
 
 # =========================================================
@@ -73,6 +73,52 @@ def cleanup_old_generated_workbooks(
 # =========================================================
 # Basic helpers
 # =========================================================
+
+# =========================================================
+# Missing helpers (added in v5 patch)
+# =========================================================
+def round_nearest_dollar(value):
+    """Round to nearest whole dollar. Returns None for blank/invalid."""
+    v = safe_num(value)
+    if v is None:
+        return None
+    try:
+        return int(round(float(v)))
+    except Exception:
+        return None
+
+def sum_extended(items):
+    """Sum extended totals from a list of dict-like items."""
+    if not items:
+        return 0.0
+    total = 0.0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        ext = safe_num(it.get("extended_total"))
+        if ext is None:
+            # try qty * unit_price if present
+            q = safe_num(it.get("qty"))
+            u = safe_num(it.get("unit_price"))
+            if q is not None and u is not None:
+                ext = q * u
+        if ext is not None:
+            total += float(ext)
+    return float(total)
+
+def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: int) -> None:
+    """Protect sheet while allowing selection/editing of intended body fields."""
+    # Unlock body entry cells (and merged top-lefts) then enable protection.
+    unlock_body_selection(ws, body_row_start=body_row_start, body_row_end=body_row_end)
+
+    ws.protection.sheet = True
+    # Allow selecting unlocked cells, disallow selecting locked cells (common UX)
+    try:
+        ws.protection.selectLockedCells = False
+        ws.protection.selectUnlockedCells = True
+    except Exception:
+        pass
+
 def safe_str(x) -> str:
     return "" if x is None else str(x)
 
@@ -700,6 +746,17 @@ class UploadFinishRequestModel(BaseModel):
     upload_id: str
     filename: str
 
+class UploadStatusRequestModel(BaseModel):
+    upload_id: str
+
+class UploadStatusResponseModel(BaseModel):
+    upload_id: str
+    chunk_count: int
+    max_index: Optional[int] = None
+    total_bytes: int
+
+
+
 def _upload_dir(upload_id: str) -> str:
     return os.path.join(UPLOAD_DIR, upload_id)
 
@@ -737,11 +794,37 @@ def _stitch_chunks_to_pdf(upload_id: str) -> str:
     d = _ensure_upload_id(upload_id)
     chunk_files = sorted([fn for fn in os.listdir(d) if fn.endswith(".chunk")])
     if not chunk_files:
-        raise HTTPException(status_code=400, detail="No chunks uploaded.")
+        status = _chunk_status(upload_id)
+    raise HTTPException(status_code=400, detail={"error":"No chunks uploaded","status":status})
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         for fn in chunk_files:
             tmp.write(open(os.path.join(d, fn), "rb").read())
         return tmp.name
+
+def _chunk_status(upload_id: str) -> Dict[str, Any]:
+    d = _upload_dir(upload_id)
+    if not os.path.isdir(d):
+        raise HTTPException(status_code=404, detail="Unknown upload_id")
+    chunk_files = sorted([fn for fn in os.listdir(d) if fn.endswith(".chunk")])
+    max_index = None
+    total_bytes = 0
+    for fn in chunk_files:
+        try:
+            # filenames are zero-padded integers like 000000.chunk
+            idx = int(fn.split(".")[0])
+            max_index = idx if max_index is None else max(max_index, idx)
+            total_bytes += os.path.getsize(os.path.join(d, fn))
+        except Exception:
+            # ignore malformed names/sizes
+            pass
+    return {
+        "upload_id": upload_id,
+        "chunk_count": len(chunk_files),
+        "max_index": max_index,
+        "total_bytes": total_bytes,
+    }
+
+
 
 # Canonical
 @app.post("/pdf-upload/start", response_model=UploadInitResponseModel)
@@ -767,7 +850,8 @@ def pdf_upload_finish(req: UploadFinishRequestModel):
     try:
         pdf_bytes = Path(pdf_path).read_bytes()
         if len(pdf_bytes) < 1000 or not pdf_bytes.startswith(b"%PDF"):
-            raise HTTPException(status_code=400, detail="Reassembled file does not look like a valid PDF (missing/invalid chunks).")
+            status = _chunk_status(req.upload_id)
+            raise HTTPException(status_code=400, detail={"error":"Reassembled file does not look like a valid PDF (missing/invalid chunks).","status":status})
 
         text = extract_text_from_pdf(pdf_path)
         estimate_data = parse_estimate_pdf_text_to_data(text)
@@ -786,6 +870,12 @@ def pdf_upload_finish(req: UploadFinishRequestModel):
             pass
         _cleanup_upload_id(req.upload_id)
 
+
+
+@app.post("/pdf-upload/status", response_model=UploadStatusResponseModel)
+def pdf_upload_status(req: UploadStatusRequestModel):
+    return _chunk_status(req.upload_id)
+
 # Compatibility aliases expected by your current OpenAPI
 @app.post("/upload/init", response_model=UploadInitResponseModel)
 def upload_init_alias():
@@ -798,6 +888,12 @@ def upload_chunk_alias(req: UploadChunkRequestModel):
 @app.post("/upload/finish")
 def upload_finish_alias(req: UploadFinishRequestModel):
     return pdf_upload_finish(req)
+
+@app.post("/upload/status", response_model=UploadStatusResponseModel)
+def upload_status_alias(req: UploadStatusRequestModel):
+    return pdf_upload_status(req)
+
+
 
 
 @app.get("/version")
