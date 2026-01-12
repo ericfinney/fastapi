@@ -30,6 +30,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
 
+APP_VERSION = "v4-base64-tolerant"
+
 
 # =========================================================
 # Cleanup: delete old generated workbooks (older than N minutes)
@@ -712,7 +714,7 @@ def _decode_b64_any(s: str) -> bytes:
         s2 += '=' * pad
 
     try:
-        return base64.b64decode(s2, validate=True)
+        return base64.b64decode(s2, validate=False)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
 
@@ -794,3 +796,8 @@ def upload_chunk_alias(req: UploadChunkRequestModel):
 @app.post("/upload/finish")
 def upload_finish_alias(req: UploadFinishRequestModel):
     return pdf_upload_finish(req)
+
+
+@app.get("/version")
+async def version():
+    return {"version": APP_VERSION}
