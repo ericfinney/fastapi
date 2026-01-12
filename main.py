@@ -32,7 +32,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
 
-APP_VERSION = "v5-status-and-missing-helpers"
+APP_VERSION = "v6-batch-chunk-and-status-gates"
 
 
 # =========================================================
@@ -842,6 +842,43 @@ def pdf_upload_chunk(req: UploadChunkRequestModel):
         f.write(chunk_bytes)
     return {"ok": True, "saved_index": req.index, "saved_bytes": len(chunk_bytes)}
 
+@app.post("/pdf-upload/chunk_batch", response_model=UploadChunkBatchResponseModel)
+def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
+    # Store multiple base64 chunks in one request to reduce tool-call count.
+    d = _upload_dir(req.upload_id)
+    os.makedirs(d, exist_ok=True)
+
+    saved_bytes = 0
+    idx = int(req.start_index)
+
+    for chunk in req.chunks:
+        # Whitespace-safe: strip any accidental newlines/spaces/tabs.
+        clean_b64 = re.sub(r"\s+", "", chunk or "")
+        if not clean_b64:
+            # skip empty chunks (should not happen)
+            idx += 1
+            continue
+
+        try:
+            data = base64.b64decode(clean_b64)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 in chunk_batch at index {idx}: {e}")
+
+        fn = os.path.join(d, f"{idx:06d}.chunk")
+        with open(fn, "wb") as f:
+            f.write(data)
+        saved_bytes += len(data)
+        idx += 1
+
+    return {
+        "ok": True,
+        "saved_start_index": int(req.start_index),
+        "saved_count": len(req.chunks),
+        "saved_bytes": saved_bytes,
+    }
+
+
+
 @app.post("/pdf-upload/finish")
 def pdf_upload_finish(req: UploadFinishRequestModel):
     cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
@@ -885,9 +922,20 @@ def upload_init_alias():
 def upload_chunk_alias(req: UploadChunkRequestModel):
     return pdf_upload_chunk(req)
 
+@app.post("/upload/chunk_batch", response_model=UploadChunkBatchResponseModel)
+def upload_chunk_batch_alias(req: UploadChunkBatchRequestModel):
+    return pdf_upload_chunk_batch(req)
+
+
+
 @app.post("/upload/finish")
 def upload_finish_alias(req: UploadFinishRequestModel):
-    return pdf_upload_finish(req)
+    try:
+        return pdf_upload_finish(req)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload/status", response_model=UploadStatusResponseModel)
 def upload_status_alias(req: UploadStatusRequestModel):
