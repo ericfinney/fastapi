@@ -32,7 +32,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
 
-APP_VERSION = "v6-batch-chunk-and-status-gates"
+APP_VERSION = "v7-store-base64-text-decode-once"
 
 
 # =========================================================
@@ -777,6 +777,29 @@ def _decode_b64_any(s: str) -> bytes:
     """Decode base64 or base64url, tolerant of whitespace/newlines and missing padding."""
     s2 = "".join(str(s).split())
 
+def _reassemble_pdf_bytes(upload_id: str) -> bytes:
+    d = _upload_dir(upload_id)
+    if not os.path.isdir(d):
+        raise HTTPException(status_code=404, detail="upload_id not found")
+    files = sorted([fn for fn in os.listdir(d) if fn.endswith(".b64")])
+    if not files:
+        raise HTTPException(status_code=400, detail="Reassembled file does not look like a valid PDF (missing/invalid chunks).")
+    # concatenate in index order
+    b64_all = ""
+    for fn in files:
+        path = os.path.join(d, fn)
+        with open(path, "r", encoding="ascii") as f:
+            b64_all += re.sub(r"\s+", "", f.read())
+    try:
+        pdf_bytes = base64.b64decode(b64_all)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Reassembled file does not look like a valid PDF (missing/invalid chunks). ({e})")
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Reassembled file does not look like a valid PDF (missing/invalid chunks).")
+    return pdf_bytes
+
+
+
     # Accept base64url (RFC 4648) by converting to standard base64 alphabet
     s2 = s2.replace('-', '+').replace('_', '/')
 
@@ -805,7 +828,7 @@ def _cleanup_upload_id(upload_id: str) -> None:
 
 def _stitch_chunks_to_pdf(upload_id: str) -> str:
     d = _ensure_upload_id(upload_id)
-    chunk_files = sorted([fn for fn in os.listdir(d) if fn.endswith(".chunk")])
+    chunk_files = sorted([fn for fn in os.listdir(d) if fn.endswith(".b64")])
     if not chunk_files:
         status = _chunk_status(upload_id)
     raise HTTPException(status_code=400, detail={"error":"No chunks uploaded","status":status})
@@ -818,12 +841,12 @@ def _chunk_status(upload_id: str) -> Dict[str, Any]:
     d = _upload_dir(upload_id)
     if not os.path.isdir(d):
         raise HTTPException(status_code=404, detail="Unknown upload_id")
-    chunk_files = sorted([fn for fn in os.listdir(d) if fn.endswith(".chunk")])
+    chunk_files = sorted([fn for fn in os.listdir(d) if fn.endswith(".b64")])
     max_index = None
     total_bytes = 0
     for fn in chunk_files:
         try:
-            # filenames are zero-padded integers like 000000.chunk
+            # filenames are zero-padded integers like 000000.b64
             idx = int(fn.split(".")[0])
             max_index = idx if max_index is None else max(max_index, idx)
             total_bytes += os.path.getsize(os.path.join(d, fn))
@@ -848,12 +871,16 @@ def pdf_upload_start():
 
 @app.post("/pdf-upload/chunk")
 def pdf_upload_chunk(req: UploadChunkRequestModel):
-    d = _ensure_upload_id(req.upload_id)
-    chunk_bytes = _decode_b64_any(req.data_base64)
-    path = os.path.join(d, f"{req.index:06d}.chunk")
-    with open(path, "wb") as f:
-        f.write(chunk_bytes)
-    return {"ok": True, "saved_index": req.index, "saved_bytes": len(chunk_bytes)}
+    # Store base64 TEXT chunks (whitespace-safe). Decode happens only after reassembly.
+    d = _upload_dir(req.upload_id)
+    os.makedirs(d, exist_ok=True)
+    clean_b64 = re.sub(r"\s+", "", req.data_base64 or "")
+    if not clean_b64:
+        raise HTTPException(status_code=400, detail="Empty data_base64")
+    fn = os.path.join(d, f"{int(req.index):06d}.b64")
+    with open(fn, "w", encoding="ascii") as f:
+        f.write(clean_b64)
+    return {"ok": True, "saved_index": int(req.index), "saved_bytes": len(clean_b64)}
 
 @app.post("/pdf-upload/chunk_batch", response_model=UploadChunkBatchResponseModel)
 def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
@@ -864,7 +891,7 @@ def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
     saved_bytes = 0
     idx = int(req.start_index)
 
-    for chunk in req.chunks:
+    for chunk in req.b64s:
         # Whitespace-safe: strip any accidental newlines/spaces/tabs.
         clean_b64 = re.sub(r"\s+", "", chunk or "")
         if not clean_b64:
@@ -877,7 +904,7 @@ def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid base64 in chunk_batch at index {idx}: {e}")
 
-        fn = os.path.join(d, f"{idx:06d}.chunk")
+        fn = os.path.join(d, f"{idx:06d}.b64")
         with open(fn, "wb") as f:
             f.write(data)
         saved_bytes += len(data)
@@ -886,7 +913,7 @@ def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
     return {
         "ok": True,
         "saved_start_index": int(req.start_index),
-        "saved_count": len(req.chunks),
+        "saved_count": len(req.b64s),
         "saved_bytes": saved_bytes,
     }
 
@@ -894,6 +921,10 @@ def pdf_upload_chunk_batch(req: UploadChunkBatchRequestModel):
 
 @app.post("/pdf-upload/finish")
 def pdf_upload_finish(req: UploadFinishRequestModel):
+    pdf_bytes = _reassemble_pdf_bytes(req.upload_id)
+    tmp_pdf_path = os.path.join(_upload_dir(req.upload_id), "_reassembled.pdf")
+    with open(tmp_pdf_path, "wb") as f:
+        f.write(pdf_bytes)
     cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
 
     pdf_path = _stitch_chunks_to_pdf(req.upload_id)
