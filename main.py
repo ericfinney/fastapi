@@ -33,6 +33,52 @@ LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+UPLOAD_DIR = os.environ.get("BOYD_UPLOAD_DIR", "/tmp/uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def cleanup_old_uploads(directory: str, older_than_minutes: int = 30) -> None:
+    """Delete incomplete upload folders older than older_than_minutes."""
+    if not os.path.isdir(directory):
+        return
+    now = time.time()
+    max_age_sec = older_than_minutes * 60
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        if not os.path.isdir(path):
+            continue
+        try:
+            age_sec = now - os.path.getmtime(path)
+            if age_sec > max_age_sec:
+                # Best-effort recursive delete
+                for root, dirs, files in os.walk(path, topdown=False):
+                    for fn in files:
+                        try: os.remove(os.path.join(root, fn))
+                        except: pass
+                    for dn in dirs:
+                        try: os.rmdir(os.path.join(root, dn))
+                        except: pass
+                try: os.rmdir(path)
+                except: pass
+                logging.info("Deleted old upload folder: %s (age %.1f min)", name, age_sec / 60.0)
+        except Exception as e:
+            logging.warning("Failed deleting upload folder %s: %s", name, e)
+
+def _upload_folder(upload_id: str) -> str:
+    return os.path.join(UPLOAD_DIR, upload_id)
+
+def _upload_meta_path(upload_id: str) -> str:
+    return os.path.join(_upload_folder(upload_id), "meta.json")
+
+def _chunk_path(upload_id: str, index: int) -> str:
+    return os.path.join(_upload_folder(upload_id), f"chunk_{index:06d}.bin")
+
+def _touch(path: str) -> None:
+    try:
+        os.utime(path, None)
+    except Exception:
+        pass
+
+
 app = FastAPI()
 
 
@@ -46,6 +92,21 @@ class PdfUrlRequest(BaseModel):
 class PdfBase64Request(BaseModel):
     filename: str
     content_base64: str
+
+
+class PdfChunkStartRequest(BaseModel):
+    filename: str
+
+class PdfChunkStartResponse(BaseModel):
+    upload_id: str
+
+class PdfChunkUploadRequest(BaseModel):
+    upload_id: str
+    index: int
+    chunk_base64: str
+
+class PdfChunkFinishRequest(BaseModel):
+    upload_id: str
 
 
 async def _download_pdf_bytes(file_url: str) -> bytes:
@@ -91,7 +152,8 @@ def _decode_pdf_base64(filename: str, content_base64: str) -> bytes:
     if not content_base64 or not isinstance(content_base64, str):
         raise HTTPException(status_code=400, detail="content_base64 must be a non-empty string")
     try:
-        pdf_bytes = base64.b64decode(content_base64, validate=True)
+        clean_b64 = re.sub(r"\s+", "", content_base64)
+        pdf_bytes = base64.b64decode(clean_b64, validate=True)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
 
@@ -877,6 +939,109 @@ async def pdf_to_excel_url(req: PdfUrlRequest):
         except:
             pass
 
+
+
+# =========================================================
+# NEW: Chunked base64 upload (for large PDFs)
+# =========================================================
+@app.post("/pdf-upload/start", response_model=PdfChunkStartResponse)
+async def pdf_upload_start(req: PdfChunkStartRequest):
+    """Start a chunked upload session. Returns an upload_id."""
+    cleanup_old_uploads(UPLOAD_DIR, older_than_minutes=30)
+    upload_id = uuid.uuid4().hex
+    folder = _upload_folder(upload_id)
+    os.makedirs(folder, exist_ok=True)
+    meta = {"filename": req.filename, "created_at": time.time()}
+    with open(_upload_meta_path(upload_id), "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+    return PdfChunkStartResponse(upload_id=upload_id)
+
+@app.post("/pdf-upload/chunk")
+async def pdf_upload_chunk(req: PdfChunkUploadRequest):
+    """Upload one chunk. chunk_base64 must be base64 of RAW BYTES for that chunk."""
+    folder = _upload_folder(req.upload_id)
+    if not os.path.isdir(folder) or not os.path.exists(_upload_meta_path(req.upload_id)):
+        raise HTTPException(status_code=404, detail="upload_id not found or expired")
+    if req.index < 0:
+        raise HTTPException(status_code=400, detail="index must be >= 0")
+
+    try:
+        clean_b64 = re.sub(r"\s+", "", req.chunk_base64)
+        chunk_bytes = base64.b64decode(clean_b64, validate=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 chunk: {e}")
+
+    if not chunk_bytes:
+        raise HTTPException(status_code=400, detail="Chunk decoded to empty bytes")
+
+    out_path = _chunk_path(req.upload_id, req.index)
+    with open(out_path, "wb") as f:
+        f.write(chunk_bytes)
+
+    # touch folder so mtime updates for expiry
+    _touch(folder)
+    return {"ok": True, "upload_id": req.upload_id, "index": req.index, "bytes": len(chunk_bytes)}
+
+@app.post("/pdf-upload/finish")
+async def pdf_upload_finish(req: PdfChunkFinishRequest):
+    """Finish a chunked upload: assemble PDF from chunks and return Excel download_url."""
+    cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
+    folder = _upload_folder(req.upload_id)
+    meta_path = _upload_meta_path(req.upload_id)
+    if not os.path.isdir(folder) or not os.path.exists(meta_path):
+        raise HTTPException(status_code=404, detail="upload_id not found or expired")
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        meta = {"filename": "uploaded.pdf"}
+
+    chunk_files = sorted([fn for fn in os.listdir(folder) if fn.startswith("chunk_") and fn.endswith(".bin")])
+    if not chunk_files:
+        raise HTTPException(status_code=400, detail="No chunks uploaded for this upload_id")
+
+    assembled = bytearray()
+    for fn in chunk_files:
+        with open(os.path.join(folder, fn), "rb") as f:
+            assembled.extend(f.read())
+
+    pdf_bytes = bytes(assembled)
+    if not pdf_bytes or len(pdf_bytes) < 1000:
+        raise HTTPException(status_code=400, detail="Assembled file appears empty or invalid")
+    if not pdf_bytes.startswith(b"%PDF") and not pdf_bytes.lstrip().startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Assembled bytes do not appear to be a PDF")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(pdf_bytes)
+        tmp_path = tmp_file.name
+
+    try:
+        extractor = EstimateExtractor(tmp_path)
+        extractor.process_pdf()
+        estimate_data = extractor.to_json_format()
+        logging.info("Extracted %s sign items from chunked PDF upload", len(estimate_data.get("sign_types", [])))
+        return _generate_excel_from_data(estimate_data)
+    except Exception as e:
+        logging.exception("Chunked PDF to Excel conversion failed")
+        raise HTTPException(status_code=500, detail=f"Chunked conversion failed: {str(e)}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+        # best-effort delete upload folder
+        try:
+            for root, dirs, files in os.walk(folder, topdown=False):
+                for fn in files:
+                    try: os.remove(os.path.join(root, fn))
+                    except: pass
+                for dn in dirs:
+                    try: os.rmdir(os.path.join(root, dn))
+                    except: pass
+            os.rmdir(folder)
+        except:
+            pass
 
 def _generate_excel_from_data(estimate_data: Dict[str, Any]):
     if not os.path.exists(TEMPLATE_PATH):
