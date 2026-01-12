@@ -5,22 +5,24 @@ import logging
 import re
 import math
 import time
-import zipfile
 import tempfile
-import shutil
+import pandas as pd
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, File, UploadFile, Body, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Protection
 
+# Import PDF extraction functionality
+import pdfplumber
+
 logging.basicConfig(level=logging.INFO)
 
-TEMPLATE_PATH = os.environ.get("BOYD_TEMPLATE_PATH", "templates/Blank.xlsx")
+TEMPLATE_PATH = os.environ.get("BOYD_TEMPLATE_PATH", "Blank.xlsx")
 SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
@@ -28,6 +30,350 @@ LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
+
+
+# =========================================================
+# PDF EXTRACTION CLASSES (from extract_estimate_data.py)
+# =========================================================
+class EstimateExtractor:
+    def __init__(self, pdf_path: str):
+        self.pdf_path = pdf_path
+        self.header_data = {}
+        self.sign_items = []
+        self.totals = {}
+        self.current_section = 'Unknown'
+    
+    def clean_price(self, price_str: str) -> float:
+        """Convert price string to float"""
+        if not price_str or price_str.strip() == '':
+            return 0.0
+        cleaned = price_str.replace('$', '').replace(',', '').strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+    
+    def extract_header_info(self, first_page_text: str) -> Dict:
+        """Extract header information from first page"""
+        header = {}
+        
+        # Extract To: Company
+        to_company_match = re.search(r'To:\s+([^\n]+?)(?=Ship To:|$)', first_page_text)
+        if to_company_match:
+            to_text = to_company_match.group(1).strip()
+            header['To_Company'] = to_text.split('Ship To:')[0].strip()
+        
+        # Extract Ship To: Location
+        ship_to_match = re.search(r'Ship To:\s+([^\n]+)', first_page_text)
+        if ship_to_match:
+            header['Ship_To_Address'] = ship_to_match.group(1).strip()
+        
+        # Extract Project ID
+        proj_id_match = re.search(r'Project Id\s*:\s*(\d+)', first_page_text)
+        if proj_id_match:
+            header['Project_ID'] = proj_id_match.group(1)
+        
+        # Extract Project Description
+        proj_desc_match = re.search(r'Project Desc\.\s*:\s*(.+?)(?=Ship Via)', first_page_text)
+        if proj_desc_match:
+            header['Project_Description'] = proj_desc_match.group(1).strip()
+        
+        # Extract Ship Via
+        ship_via_match = re.search(r'Ship Via\s*:\s*(.+?)(?=\n|P\.O\.)', first_page_text)
+        if ship_via_match:
+            header['Ship_Via'] = ship_via_match.group(1).strip()
+        
+        # Extract Sales Rep
+        sales_match = re.search(r'Salesperson\s*:\s*(.+?)(?=\n|$)', first_page_text)
+        if sales_match:
+            header['Sales_Rep'] = sales_match.group(1).strip()
+        
+        # Extract Project Manager
+        pm_match = re.search(r'Project Manager:\s*(.+?)(?=\n|$)', first_page_text)
+        if pm_match:
+            header['Project_Manager'] = pm_match.group(1).strip()
+        
+        # Extract Project Engineer
+        pe_match = re.search(r'Project Engineer:\s*(.+?)(?=\n|$)', first_page_text)
+        if pe_match:
+            header['Project_Engineer'] = pe_match.group(1).strip()
+        
+        # Extract Date
+        date_match = re.search(r'Date\s+(\d{1,2}/\d{1,2}/\d{2,4})', first_page_text)
+        if date_match:
+            header['Estimate_Date'] = date_match.group(1)
+        
+        return header
+    
+    def extract_sign_items_from_text(self, text: str, current_section: str = '') -> List[Dict]:
+        """Extract sign items from text using pattern matching"""
+        items = []
+        
+        lines = text.split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Match the price section at the end: QTY $ PRICE $ TOTAL
+            price_match = re.search(r'(\d+)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)$', line)
+            
+            if price_match:
+                qty = int(price_match.group(1))
+                unit_price = self.clean_price(price_match.group(2))
+                total = self.clean_price(price_match.group(3))
+                
+                # Extract the code and description (everything before the price section)
+                prefix = line[:price_match.start()].strip()
+                
+                # Match CODE - DESCRIPTION
+                # CODE can be: letters, optionally periods and more letters, then digits, then optionally more letters/digits/periods
+                code_match = re.match(r'^([a-zA-Z]+[\.a-zA-Z]*\d+[a-zA-Z0-9\.]*)\s+-\s+(.+)$', prefix)
+                
+                if code_match:
+                    sign_code = code_match.group(1)
+                    description = code_match.group(2).strip()
+                    
+                    # Skip installation, packing, shipping, and permitting items
+                    if any(keyword in description.lower() for keyword in ['installation', 'packing', 'crating', 'shipping', 'permitting']):
+                        continue
+                    
+                    items.append({
+                        'Section': current_section,
+                        'Sign_Type': sign_code,
+                        'Description': description,
+                        'Quantity': qty,
+                        'Unit_Price': unit_price,
+                        'Extended_Total': total
+                    })
+        
+        return items
+    
+    def extract_cost_items_from_text(self, text: str, current_section: str = '') -> List[Dict]:
+        """Extract packing, shipping, mobilization, installation, and permitting as line items"""
+        items = []
+        
+        # Packing/Crating
+        packing_match = re.search(r'Packing/Crating\s+(\d+)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)', text)
+        if packing_match:
+            items.append({
+                'Section': current_section,
+                'Sign_Type': 'PACKING',
+                'Description': 'Packing/Crating',
+                'Quantity': int(packing_match.group(1)),
+                'Unit_Price': self.clean_price(packing_match.group(2)),
+                'Extended_Total': self.clean_price(packing_match.group(3))
+            })
+        
+        # Shipping
+        shipping_match = re.search(r'Shipping\s+(\d+)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)', text)
+        if shipping_match:
+            items.append({
+                'Section': current_section,
+                'Sign_Type': 'SHIPPING',
+                'Description': 'Shipping',
+                'Quantity': int(shipping_match.group(1)),
+                'Unit_Price': self.clean_price(shipping_match.group(2)),
+                'Extended_Total': self.clean_price(shipping_match.group(3))
+            })
+        
+        # Mobilization
+        mob_match = re.search(r'Installation - Mobilization & Other Expenses\s+(\d+)\s*\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)', text)
+        if mob_match:
+            items.append({
+                'Section': current_section,
+                'Sign_Type': 'MOBILIZATION',
+                'Description': 'Installation - Mobilization & Other Expenses',
+                'Quantity': int(mob_match.group(1)),
+                'Unit_Price': self.clean_price(mob_match.group(2)),
+                'Extended_Total': self.clean_price(mob_match.group(3))
+            })
+        
+        # Installation Labor (Boyd)
+        labor_match = re.search(r'Installation - Onsite Labor\s+(\d+)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)', text)
+        if labor_match:
+            items.append({
+                'Section': current_section,
+                'Sign_Type': 'INSTALLATION',
+                'Description': 'Installation - Onsite Labor',
+                'Quantity': int(labor_match.group(1)),
+                'Unit_Price': self.clean_price(labor_match.group(2)),
+                'Extended_Total': self.clean_price(labor_match.group(3))
+            })
+        
+        # More Vang Installation (or other subcontractor)
+        more_vang_patterns = [
+            r'Full.*?Installation by More Vang\s+(\d+)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)',
+            r'Installation - Onsite Labor by.*?\s+(\d+)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)'
+        ]
+        
+        for pattern in more_vang_patterns:
+            more_vang_match = re.search(pattern, text)
+            if more_vang_match:
+                desc_match = re.search(r'(Full.*?Installation by [^\n]+)', text)
+                description = desc_match.group(1) if desc_match else 'Subcontractor Installation'
+                
+                items.append({
+                    'Section': current_section,
+                    'Sign_Type': 'INSTALLATION',
+                    'Description': description,
+                    'Quantity': int(more_vang_match.group(1)),
+                    'Unit_Price': self.clean_price(more_vang_match.group(2)),
+                    'Extended_Total': self.clean_price(more_vang_match.group(3))
+                })
+                break
+        
+        # Permitting
+        permitting_match = re.search(r'Permitting\s+(\d+)\s+\$\s*([\d,]+\.\d+)\s+\$\s*([\d,]+\.\d+)', text)
+        if permitting_match:
+            items.append({
+                'Section': current_section,
+                'Sign_Type': 'PERMITTING',
+                'Description': 'Permitting',
+                'Quantity': int(permitting_match.group(1)),
+                'Unit_Price': self.clean_price(permitting_match.group(2)),
+                'Extended_Total': self.clean_price(permitting_match.group(3))
+            })
+        
+        return items
+    
+    def extract_totals(self, last_page_text: str) -> Dict:
+        """Extract final totals from last page"""
+        totals = {}
+        
+        # Sub-total
+        subtotal_match = re.search(r'SUB-TOTAL\s+\$\s*([\d,]+\.\d{2})', last_page_text)
+        if subtotal_match:
+            totals['Sub_Total'] = self.clean_price(subtotal_match.group(1))
+        
+        # Mark-up
+        markup_match = re.search(r'MARK-UP\s+\$\s*([\d,]+\.\d{2})', last_page_text)
+        if markup_match:
+            totals['Mark_Up'] = self.clean_price(markup_match.group(1))
+        
+        # Total (final) - use negative lookbehind to avoid SUB-TOTAL
+        total_match = re.search(r'(?<!SUB-)TOTAL\s+\$\s*([\d,]+\.\d{2})', last_page_text)
+        if total_match:
+            totals['Grand_Total'] = self.clean_price(total_match.group(1))
+        
+        return totals
+    
+    def process_pdf(self):
+        """Main method to process the PDF"""
+        with pdfplumber.open(self.pdf_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                text = page.extract_text()
+                
+                # Extract header from first page
+                if page_num == 0:
+                    self.header_data = self.extract_header_info(text)
+                
+                # Process line by line for section tracking
+                lines = text.split('\n')
+                page_section = self.current_section
+                
+                for line_num, line in enumerate(lines):
+                    # Check if this line is a section marker
+                    # Check more specific patterns first
+                    line_upper = line.upper()
+                    new_section = None
+                    
+                    if 'SIGNAGE SAMPLES PACKAGE' in line_upper:
+                        new_section = 'Signage Samples Package'
+                    elif 'ECCLES - INTERIOR SIGNAGE PACKAGE' in line_upper:
+                        new_section = 'Eccles - Interior Signage Package'
+                    elif '1951 - INTERIOR SIGNAGE PACKAGE' in line_upper:
+                        new_section = '1951 - Interior Signage Package'
+                    elif '1951 - PARKING GARAGE SIGNAGE PACKAGE' in line_upper:
+                        new_section = '1951 - Parking Garage Signage Package'
+                    elif 'ECCLES - GRAPHICS SIGNAGE PACKAGE' in line_upper:
+                        new_section = 'Eccles - Graphics Signage Package'
+                    elif '1951 - GRAPHICS SIGNAGE PACKAGE' in line_upper:
+                        new_section = '1951 - Graphics Signage Package'
+                    elif 'SITE - SIGNAGE PACKAGE' in line_upper:
+                        new_section = 'Site - Signage Package'
+                    elif 'SIGNAGE PACKAGE' in line_upper and 'SAMPLES' not in line_upper:
+                        new_section = 'Signage Package'
+                    
+                    if new_section:
+                        page_section = new_section
+                        self.current_section = new_section
+                        continue
+                    
+                    # Try to extract sign item from this line
+                    items = self.extract_sign_items_from_text(line, page_section)
+                    self.sign_items.extend(items)
+                    
+                    # Try to extract cost item from this line
+                    cost_items = self.extract_cost_items_from_text(line, page_section)
+                    self.sign_items.extend(cost_items)
+                
+                # Extract totals from last page
+                if page_num == len(pdf.pages) - 1:
+                    self.totals = self.extract_totals(text)
+    
+    def to_json_format(self) -> Dict:
+        """Convert extracted data to the JSON format expected by main.py"""
+        # Filter out cost items (PACKING, SHIPPING, MOBILIZATION, INSTALLATION, PERMITTING)
+        cost_types = {'PACKING', 'SHIPPING', 'MOBILIZATION', 'INSTALLATION', 'PERMITTING'}
+        
+        sign_items = [item for item in self.sign_items if item['Sign_Type'] not in cost_types]
+        shipping_items = [item for item in self.sign_items if item['Sign_Type'] == 'SHIPPING']
+        installation_items = [item for item in self.sign_items if item['Sign_Type'] in {'INSTALLATION', 'MOBILIZATION'}]
+        
+        # Format for the Excel generator
+        result = {
+            "estimate_date": self.header_data.get('Estimate_Date', ''),
+            "project_id": self.header_data.get('Project_ID', ''),
+            "salesperson": self.header_data.get('Sales_Rep', ''),
+            "project_manager": self.header_data.get('Project_Manager', ''),
+            "project_description": self.header_data.get('Project_Description', ''),
+            "sold_to": {
+                "name": self.header_data.get('To_Company', ''),
+                "address_lines": [],
+                "city": "",
+                "state": "",
+                "zip": "",
+                "phone": ""
+            },
+            "ship_to": {
+                "name": self.header_data.get('Ship_To_Address', ''),
+                "address_lines": [],
+                "city": "",
+                "state": "",
+                "zip": "",
+                "phone": ""
+            },
+            "sign_types": [
+                {
+                    "sign_type": f"{item['Sign_Type']} - {item['Description']}",
+                    "description": item['Description'],
+                    "qty": item['Quantity'],
+                    "unit_price": item['Unit_Price']
+                }
+                for item in sign_items
+            ],
+            "shipping": [
+                {
+                    "description": item['Description'],
+                    "extended": item['Extended_Total']
+                }
+                for item in shipping_items
+            ],
+            "installation": [
+                {
+                    "description": item['Description'],
+                    "extended": item['Extended_Total']
+                }
+                for item in installation_items
+            ],
+            "totals": {
+                "subtotal": self.totals.get('Sub_Total', 0),
+                "markup": self.totals.get('Mark_Up', 0),
+                "total": self.totals.get('Grand_Total', 0)
+            }
+        }
+        
+        return result
 
 
 # =========================================================
@@ -216,342 +562,169 @@ def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
     return s, ""
 
 
-# =========================================================
-# Merge shifting helpers (used by adjust body)
-# =========================================================
-CELL_RE = re.compile(r"^([A-Z]+)(\d+)$")
+def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
+    """
+    Sum the 'extended' field from a list of items
+    """
+    if not items:
+        return None
+    total = 0.0
+    for item in items:
+        ext = safe_num(item.get("extended"))
+        if ext is not None:
+            total += ext
+    return total if total > 0 else None
 
-def shift_cell_ref(cell_ref: str, row_offset: int) -> str:
-    m = CELL_RE.match(cell_ref)
-    if not m:
+
+def shift_cell_ref(cell_ref: str, offset: int) -> str:
+    """
+    'F48' + 5 => 'F53'
+    """
+    match = re.match(r"^([A-Z]+)(\d+)$", cell_ref)
+    if not match:
         return cell_ref
-    col, row = m.group(1), int(m.group(2))
-    return f"{col}{row + row_offset}"
-
-def parse_range(a1_range: str) -> Tuple[str, str]:
-    if ":" in a1_range:
-        a, b = a1_range.split(":")
-        return a, b
-    return a1_range, a1_range
-
-def split_ref(ref: str):
-    m = CELL_RE.match(ref)
-    if not m:
-        return ref, None
-    return m.group(1), int(m.group(2))
-
-def shift_range_overlap_safe(a1_range: str, footer_start_row: int, row_offset: int) -> str:
-    a, b = parse_range(a1_range)
-    _, a_row = split_ref(a)
-    _, b_row = split_ref(b)
-
-    if a_row is None or b_row is None:
-        return a1_range
-
-    top = min(a_row, b_row)
-    bottom = max(a_row, b_row)
-
-    should_shift = (top >= footer_start_row) or (top < footer_start_row <= bottom)
-
-    def apply_shift(ref):
-        col, row = split_ref(ref)
-        if row is None:
-            return ref
-        if should_shift:
-            row += row_offset
-        return f"{col}{row}"
-
-    new_a = apply_shift(a)
-    new_b = apply_shift(b)
-    return f"{new_a}:{new_b}" if ":" in a1_range else new_a
-
-def save_merged_ranges(ws) -> List[str]:
-    return [str(rng) for rng in ws.merged_cells.ranges]
-
-def unmerge_all(ws, merges: List[str]):
-    for rng in merges:
-        ws.unmerge_cells(rng)
-
-def restore_merges(ws, merges: List[str], footer_start_row: int, row_offset: int):
-    for rng in merges:
-        new_rng = shift_range_overlap_safe(rng, footer_start_row, row_offset)
-        ws.merge_cells(new_rng)
-
-def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
-    ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
-    for col in range(1, max_col + 1):
-        src = ws.cell(row=src_row, column=col)
-        dst = ws.cell(row=dst_row, column=col)
-        if src.has_style:
-            dst._style = copy(src._style)
-        dst.number_format = src.number_format
-        dst.alignment = copy(src.alignment)
-        dst.border = copy(src.border)
-        dst.fill = copy(src.fill)
-        dst.font = copy(src.font)
-        # Don't copy protection - we'll set it explicitly later
-        # dst.protection = copy(src.protection)
+    col, row = match.groups()
+    new_row = int(row) + offset
+    return f"{col}{new_row}"
 
 
-# =========================================================
-# Body adjust with merge + style preservation
-# =========================================================
 def adjust_body_rows_preserve_footer(
     ws,
     sign_count: int,
     body_start: int = 28,
     body_end: int = 47,
-    extra_blank_rows: int = 3
-) -> int:
-    base_rows = body_end - body_start + 1
-    needed_rows = sign_count + extra_blank_rows
-    footer_start = body_end + 1
-    diff = needed_rows - base_rows
+    extra_blank_rows: int = 3,
+):
+    """
+    Preserve footer by inserting/deleting rows.
+    Returns row_offset.
+    """
+    default_body_rows = body_end - body_start + 1
+    total_body_rows_needed = sign_count + extra_blank_rows
+    row_offset = total_body_rows_needed - default_body_rows
 
-    if diff == 0:
-        return 0
-
-    merges = save_merged_ranges(ws)
-    unmerge_all(ws, merges)
-
-    max_col = ws.max_column
-
-    if diff > 0:
-        logging.info("Inserting %d row(s) at %d to expand body.", diff, footer_start)
-        ws.insert_rows(footer_start, amount=diff)
-        for r in range(footer_start, footer_start + diff):
-            copy_row_style(ws, src_row=body_end, dst_row=r, max_col=max_col)
+    if row_offset > 0:
+        ws.insert_rows(body_end + 1, amount=row_offset)
+        logging.info(f"Inserted {row_offset} rows after row {body_end}")
+    elif row_offset < 0:
+        ws.delete_rows(body_start, amount=abs(row_offset))
+        logging.info(f"Deleted {abs(row_offset)} rows starting from row {body_start}")
     else:
-        delete_count = abs(diff)
-        delete_start = body_start + needed_rows
-        logging.info("Deleting %d row(s) at %d to shrink body.", delete_count, delete_start)
-        ws.delete_rows(delete_start, amount=delete_count)
+        logging.info("No row adjustment needed.")
 
-    restore_merges(ws, merges, footer_start, diff)
-    return diff
+    return row_offset
 
 
-# =========================================================
-# Totals helpers
-# =========================================================
-def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
-    if not items:
-        return None
-    total = 0.0
-    found = False
-    for it in items:
-        val = safe_num(it.get("extended_total"))
-        if val is not None:
-            total += val
-            found = True
-    return total if found else None
-
-
-# =========================================================
-# Approximate Row Height "AutoFit"
-# =========================================================
-def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[str], min_height: float = 15.0):
-    CHARS_PER_LINE = 60
-    LINE_HEIGHT = 15
+def approximate_autofit_rows(
+    ws,
+    row_start: int,
+    row_end: int,
+    text_cols: List[str],
+    min_height: float = 15.0,
+    chars_per_line: int = 50
+) -> None:
+    """
+    Naive auto-fit for rows in text columns.
+    """
     for r in range(row_start, row_end + 1):
         max_lines = 1
-        for col in text_cols:
-            v = ws[f"{col}{r}"].value
-            if not v:
-                continue
-            text = str(v)
-            explicit_lines = text.split("\n")
-            line_count = 0
-            for ln in explicit_lines:
-                if not ln:
-                    line_count += 1
-                else:
-                    wrapped = max(1, (len(ln) // CHARS_PER_LINE) + (1 if len(ln) % CHARS_PER_LINE else 0))
-                    line_count += wrapped
-            max_lines = max(max_lines, line_count)
-        ws.row_dimensions[r].height = max(min_height, max_lines * LINE_HEIGHT)
+        for col_letter in text_cols:
+            cell = ws[f"{col_letter}{r}"]
+            text = str(cell.value) if cell.value else ""
+            lines_estimate = max(1, len(text) // chars_per_line)
+            if lines_estimate > max_lines:
+                max_lines = lines_estimate
+        new_height = max(min_height, min_height * max_lines)
+        ws.row_dimensions[r].height = new_height
 
 
-# =========================================================
-# Selection control: ONLY allow selecting body B–E
-# =========================================================
-def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
+def apply_sheet_protection_for_selection(
+    ws,
+    body_row_start: int,
+    body_row_end: int,
+    password: Optional[str] = None
+) -> None:
     """
-    Excel decides selection/lock behavior for merged ranges based on the *top-left* cell.
-    So we must:
-      1) Unlock B–E in body rows
-      2) Unlock the top-left of any merged range that intersects B–E and the body rows
-      3) Keep F locked (and everything else locked)
+    CRITICAL: Must be the VERY LAST thing before saving - don't touch any cells after this!
+    Locks everything, then unlocks B-E in the body rows.
     """
-    # 1) Unlock B–E directly
+    lock_all_cells(ws, ws.max_row, ws.max_column)
     for r in range(body_row_start, body_row_end + 1):
-        for col in ("B", "C", "D", "E"):
-            unlock_cell(ws, f"{col}{r}")
+        for c in ["B", "C", "D", "E"]:
+            unlock_cell(ws, f"{c}{r}")
 
-    # 2) Unlock top-left of merged ranges that intersect (rows body) and (cols B–E)
-    # B=2, E=5
-    for rng in ws.merged_cells.ranges:
-        min_row, max_row = rng.min_row, rng.max_row
-        min_col, max_col = rng.min_col, rng.max_col
-
-        rows_intersect = not (max_row < body_row_start or min_row > body_row_end)
-        cols_intersect = not (max_col < 2 or min_col > 5)
-
-        if rows_intersect and cols_intersect:
-            ws.cell(row=min_row, column=min_col).protection = Protection(locked=False)
-
-
-def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: int) -> None:
-    """
-    Locks everything, unlocks only B–E body cells, then enables sheet protection
-    so ONLY those unlocked cells are selectable.
-    """
-    logging.info(f"Applying sheet protection for body rows {body_row_start} to {body_row_end}")
-    
-    # Lock everything in the used region
-    max_row = max(ws.max_row, body_row_end + 5)
-    max_col = max(ws.max_column, 6)  # at least A–F
-    logging.info(f"Locking all cells up to row {max_row}, col {max_col}")
-    lock_all_cells(ws, max_row=max_row, max_col=max_col)
-
-    # Unlock the allowed body selection area (and merged top-lefts)
-    logging.info(f"Unlocking body cells B-E in rows {body_row_start}-{body_row_end}")
-    unlock_body_selection(ws, body_row_start, body_row_end)
-    
-    # Verify a few cells are actually unlocked BEFORE enabling protection
-    test_cells = [f"B{body_row_start}", f"C{body_row_start}", f"D{body_row_start}", f"E{body_row_start}", f"A{body_row_start}", f"F{body_row_start}"]
-    for cell_ref in test_cells:
-        locked = ws[cell_ref].protection.locked
-        logging.info(f"BEFORE protection - Cell {cell_ref} locked status: {locked}")
-
-    # DON'T set selectLockedCells or selectUnlockedCells - preserve template settings
-    # Just re-enable sheet protection
-    logging.info("Re-enabling sheet protection (preserving template EnableSelection setting)")
     ws.protection.sheet = True
-    
-    # Verify protection settings
-    logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
-    
-    # Verify cells are STILL unlocked after enabling protection
-    for cell_ref in test_cells:
-        locked = ws[cell_ref].protection.locked
-        logging.info(f"AFTER protection - Cell {cell_ref} locked status: {locked}")
+    ws.protection.password = password
+    ws.protection.enable()
+
+    ws.protection.selectLockedCells = False
+    ws.protection.selectUnlockedCells = True
+    ws.protection.formatCells = False
+    ws.protection.formatColumns = False
+    ws.protection.formatRows = False
+    ws.protection.insertColumns = False
+    ws.protection.insertRows = False
+    ws.protection.insertHyperlinks = False
+    ws.protection.deleteColumns = False
+    ws.protection.deleteRows = False
+    ws.protection.sort = False
+    ws.protection.autoFilter = False
+    ws.protection.pivotTables = False
+    ws.protection.objects = False
+    ws.protection.scenarios = False
+
+    logging.info("Applied sheet protection - users can ONLY select & modify B-E in body rows.")
 
 
-def fix_sheet_protection_xml(xlsx_path: str, sheet_name: str = "Proposal"):
+# =========================================================
+# NEW: PDF Upload and Conversion Endpoint
+# =========================================================
+@app.post("/convert-pdf")
+async def convert_pdf(file: UploadFile = File(...)):
     """
-    Post-process the Excel file to fix sheet protection XML.
-    openpyxl doesn't save selectLockedCells/selectUnlockedCells correctly,
-    so we manually edit the XML.
+    Accept a PDF estimate file, extract data, and return JSON format
     """
-    # Create a temp directory to extract the xlsx
-    temp_dir = tempfile.mkdtemp()
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    # Save uploaded file temporarily
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        content = await file.read()
+        tmp_file.write(content)
+        tmp_path = tmp_file.name
     
     try:
-        # Extract the xlsx (it's just a zip file)
-        with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
+        # Extract data from PDF
+        extractor = EstimateExtractor(tmp_path)
+        extractor.process_pdf()
         
-        # Find the sheet XML file (usually xl/worksheets/sheet1.xml)
-        # We need to find which sheet number corresponds to our sheet name
-        workbook_xml = os.path.join(temp_dir, 'xl', 'workbook.xml')
-        tree = ET.parse(workbook_xml)
-        root = tree.getroot()
+        # Convert to JSON format
+        json_data = extractor.to_json_format()
         
-        # Find sheet ID for our sheet name
-        ns = {'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-        sheet_id = None
-        for sheet in root.findall('.//main:sheet', ns):
-            if sheet.get('name') == sheet_name:
-                # Get the rId and find corresponding sheet file
-                sheet_id = sheet.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
-                break
+        logging.info(f"Extracted {len(json_data['sign_types'])} sign items from PDF")
         
-        if not sheet_id:
-            logging.warning(f"Could not find sheet '{sheet_name}' in workbook XML")
-            return
-        
-        # Parse the rels file to find the actual sheet file
-        rels_file = os.path.join(temp_dir, 'xl', '_rels', 'workbook.xml.rels')
-        rels_tree = ET.parse(rels_file)
-        rels_root = rels_tree.getroot()
-        
-        sheet_file = None
-        rels_ns = {'rel': 'http://schemas.openxmlformats.org/package/2006/relationships'}
-        for rel in rels_root.findall('.//rel:Relationship', rels_ns):
-            if rel.get('Id') == sheet_id:
-                sheet_file = rel.get('Target')
-                break
-        
-        if not sheet_file:
-            logging.warning(f"Could not find sheet file for sheet ID '{sheet_id}'")
-            return
-        
-        # Now edit the sheet XML
-        sheet_xml_path = os.path.join(temp_dir, 'xl', sheet_file)
-        sheet_tree = ET.parse(sheet_xml_path)
-        sheet_root = sheet_tree.getroot()
-        
-        # Find or create the sheetProtection element
-        protection = sheet_root.find('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheetProtection')
-        
-        if protection is not None:
-            # Remove selectLockedCells attribute if it exists
-            if 'selectLockedCells' in protection.attrib:
-                del protection.attrib['selectLockedCells']
-            
-            # Set selectUnlockedCells to true
-            # According to Excel XML spec, omitting selectLockedCells means False
-            # Setting selectUnlockedCells to 1 means True
-            protection.set('selectUnlockedCells', '1')
-            
-            logging.info("Updated sheetProtection XML: removed selectLockedCells, set selectUnlockedCells=1")
-            
-            # Write back the modified XML
-            sheet_tree.write(sheet_xml_path, encoding='utf-8', xml_declaration=True)
-            
-            # Re-zip everything back into the xlsx
-            with zipfile.ZipFile(xlsx_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
-                for root_dir, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        file_path = os.path.join(root_dir, file)
-                        arc_name = os.path.relpath(file_path, temp_dir)
-                        zip_ref.write(file_path, arc_name)
-            
-            logging.info(f"Successfully fixed sheet protection XML in {xlsx_path}")
-        else:
-            logging.warning("No sheetProtection element found in XML")
+        return JSONResponse({"success": True, "data": json_data})
     
     except Exception as e:
-        logging.error(f"Failed to fix sheet protection XML: {e}")
+        logging.exception("PDF extraction failed")
+        raise HTTPException(status_code=500, detail=f"PDF extraction failed: {str(e)}")
     
     finally:
-        # Clean up temp directory
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        # Clean up temporary file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 
 
 # =========================================================
-# FastAPI endpoints
+# Generate proposal from JSON (original endpoint)
 # =========================================================
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "template_exists": os.path.exists(TEMPLATE_PATH),
-        "template_path": TEMPLATE_PATH,
-        "sheet_name": SHEET_NAME,
-        "logo_exists": os.path.exists(LOGO_PATH),
-        "logo_path": LOGO_PATH
-    }
-
-
-@app.post("/generate_proposal")
-def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
-    logging.info("Incoming request: payload keys = %s", list(payload.keys()) if payload else None)
-
-    if not payload or "payload" not in payload:
-        raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
-
+@app.post("/generate-proposal")
+def generate_proposal(payload: Dict[str, Any] = Body(...)):
+    """
+    Original endpoint - accepts JSON payload
+    """
     # Delete old outputs (older than 30 minutes)
     cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
 
@@ -563,6 +736,55 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     if not isinstance(estimate_data, dict) or not estimate_data:
         raise HTTPException(status_code=400, detail="Decoded 'payload' must be a non-empty JSON object.")
 
+    return _generate_excel_from_data(estimate_data)
+
+
+# =========================================================
+# NEW: Combined endpoint - PDF to Excel in one call
+# =========================================================
+@app.post("/pdf-to-excel")
+async def pdf_to_excel(file: UploadFile = File(...)):
+    """
+    Accept a PDF estimate file and directly generate an Excel proposal
+    """
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+    
+    # Save uploaded file temporarily
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+        content = await file.read()
+        tmp_file.write(content)
+        tmp_path = tmp_file.name
+    
+    try:
+        # Extract data from PDF
+        extractor = EstimateExtractor(tmp_path)
+        extractor.process_pdf()
+        
+        # Convert to JSON format
+        estimate_data = extractor.to_json_format()
+        
+        logging.info(f"Extracted {len(estimate_data['sign_types'])} sign items from PDF")
+        
+        # Generate Excel
+        return _generate_excel_from_data(estimate_data)
+    
+    except Exception as e:
+        logging.exception("PDF to Excel conversion failed")
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
+    
+    finally:
+        # Clean up temporary file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+def _generate_excel_from_data(estimate_data: Dict[str, Any]):
+    """
+    Core logic to generate Excel from estimate data (extracted from original endpoint)
+    """
     if not os.path.exists(TEMPLATE_PATH):
         raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
 
@@ -573,7 +795,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         ws = wb[SHEET_NAME]
         
         # DON'T replace the protection object - just disable it temporarily
-        # The template has the correct EnableSelection setting we want to preserve
         ws.protection.sheet = False
         
         logging.info("Disabled template sheet protection (preserving settings)")
@@ -765,3 +986,15 @@ def download_file(filename: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=filename
     )
+
+
+@app.get("/")
+def root():
+    return {
+        "service": "Boyd Sign Systems - Estimate Processor",
+        "endpoints": {
+            "/convert-pdf": "POST - Upload PDF, get JSON data",
+            "/pdf-to-excel": "POST - Upload PDF, get Excel file directly",
+            "/generate-proposal": "POST - Send JSON data, get Excel file"
+        }
+    }

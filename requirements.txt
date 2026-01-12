@@ -3,3 +3,5 @@ uvicorn
 openpyxl
 python-multipart
 pillow
+pdfplumber
+pandas
