@@ -699,8 +699,18 @@ class UploadFinishRequestModel(BaseModel):
 def _upload_dir(upload_id: str) -> str:
     return os.path.join(UPLOAD_DIR, upload_id)
 
-def _decode_base64_strict(s: str) -> bytes:
+def _decode_b64_any(s: str) -> bytes:
+    """Decode base64 or base64url, tolerant of whitespace/newlines and missing padding."""
     s2 = "".join(str(s).split())
+
+    # Accept base64url (RFC 4648) by converting to standard base64 alphabet
+    s2 = s2.replace('-', '+').replace('_', '/')
+
+    # Fix missing padding
+    pad = (-len(s2)) % 4
+    if pad:
+        s2 += '=' * pad
+
     try:
         return base64.b64decode(s2, validate=True)
     except Exception as e:
@@ -739,7 +749,7 @@ def pdf_upload_start():
 @app.post("/pdf-upload/chunk")
 def pdf_upload_chunk(req: UploadChunkRequestModel):
     d = _ensure_upload_id(req.upload_id)
-    chunk_bytes = _decode_base64_strict(req.data_base64)
+    chunk_bytes = _decode_b64_any(req.data_base64)
     path = os.path.join(d, f"{req.index:06d}.chunk")
     with open(path, "wb") as f:
         f.write(chunk_bytes)
