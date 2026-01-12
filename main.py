@@ -13,6 +13,9 @@ from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, File, UploadFile, Body, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel
+import httpx
+
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Protection
@@ -30,6 +33,50 @@ LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 app = FastAPI()
+
+
+# =========================================================
+# URL request models
+# =========================================================
+class PdfUrlRequest(BaseModel):
+    file_url: str
+
+
+async def _download_pdf_bytes(file_url: str) -> bytes:
+    """
+    Downloads a PDF from a URL and returns raw bytes.
+    This is used when the GPT Action platform can't send multipart file uploads.
+    """
+    if not file_url or not isinstance(file_url, str):
+        raise HTTPException(status_code=400, detail="file_url must be a non-empty string")
+
+    # Basic sanity check (optional)
+    if not (file_url.startswith("http://") or file_url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="file_url must start with http:// or https://")
+
+    try:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            resp = await client.get(file_url)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "").lower()
+
+            pdf_bytes = resp.content
+            if not pdf_bytes or len(pdf_bytes) < 1000:
+                raise HTTPException(status_code=400, detail="Downloaded file appears empty or invalid")
+
+            # If content-type isn't pdf, still allow as long as bytes look like a PDF
+            # PDF signature usually starts with %PDF
+            if "pdf" not in content_type and not pdf_bytes.startswith(b"%PDF"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Downloaded content does not appear to be a PDF (content-type: {content_type})"
+                )
+            return pdf_bytes
+
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download file_url (HTTP): {str(e)}")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download file_url (network): {str(e)}")
 
 
 # =========================================================
@@ -261,7 +308,7 @@ class EstimateExtractor:
         """Main method to process the PDF"""
         with pdfplumber.open(self.pdf_path) as pdf:
             for page_num, page in enumerate(pdf.pages):
-                text = page.extract_text()
+                text = page.extract_text() or ""
                 
                 # Extract header from first page
                 if page_num == 0:
@@ -385,13 +432,6 @@ def cleanup_old_generated_workbooks(
     filename_prefix: str = "Boyd_Proposal_",
     allowed_exts: Tuple[str, ...] = (".xlsx", ".xlsm"),
 ) -> None:
-    """
-    Deletes generated proposal files older than N minutes.
-    Safe-guards:
-      - Only deletes files starting with filename_prefix
-      - Only deletes allowed_exts
-      - Only deletes regular files
-    """
     if not os.path.isdir(directory):
         return
 
@@ -433,11 +473,6 @@ def safe_num(x):
         return None
 
 def round_up_dollars(value):
-    """
-    Always round UP to the next whole dollar.
-    12.00 -> 12
-    12.01 -> 13
-    """
     if value is None or value == "":
         return None
     try:
@@ -446,11 +481,6 @@ def round_up_dollars(value):
         return None
 
 def round_nearest_dollar(value):
-    """
-    Round to nearest whole dollar using standard rounding.
-    12.49 -> 12
-    12.50 -> 13
-    """
     if value is None or value == "":
         return None
     try:
@@ -465,9 +495,6 @@ def write_cell(ws, cell: str, value):
     ws[cell].value = value
 
 def insert_logo(ws):
-    """
-    Reinserts logo at A1 every time. Pillow must be installed.
-    """
     if not os.path.exists(LOGO_PATH):
         logging.warning("Logo not found at %s; skipping insert.", LOGO_PATH)
         return
@@ -485,9 +512,6 @@ def unlock_cell(ws, cell_ref: str):
     ws[cell_ref].protection = Protection(locked=False)
 
 def lock_all_cells(ws, max_row: int, max_col: int) -> None:
-    """
-    Lock all cells in a rectangular region.
-    """
     for r in range(1, max_row + 1):
         for c in range(1, max_col + 1):
             ws.cell(row=r, column=c).protection = Protection(locked=True)
@@ -511,18 +535,9 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 # =========================================================
 # Sign type + summary split (ROBUST)
 # =========================================================
-# Handles:
-#   "A1 - Room ID"
-#   "A1- Room ID"
-#   "A1 -Room ID"
-#   "E5.P&P, D/F - Double Sided 12 x 18 DOT, Post w/ Plate Mount"
 TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
 
 def looks_like_sign_code(code: str) -> bool:
-    """
-    Allow commas/spaces like: "E5.P&P, D/F"
-    Keep guardrails to avoid splitting normal sentences.
-    """
     if not code:
         return False
     c = code.strip()
@@ -535,17 +550,6 @@ def looks_like_sign_code(code: str) -> bool:
     return True
 
 def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
-    """
-    Splits the FIRST dash separator into:
-      (sign_type_code, summary_text)
-
-    Examples:
-      "A1 - Room ID" -> ("A1", "Room ID")
-      "A1- Room ID"  -> ("A1", "Room ID")
-      "A1 -Room ID"  -> ("A1", "Room ID")
-      "E5.P&P, D/F - Double Sided 12 x 18 DOT, Post w/ Plate Mount"
-        -> ("E5.P&P, D/F", "Double Sided 12 x 18 DOT, Post w/ Plate Mount")
-    """
     if not raw_sign_type:
         return "", ""
     s = str(raw_sign_type).strip()
@@ -563,9 +567,6 @@ def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
 
 
 def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
-    """
-    Sum the 'extended' field from a list of items
-    """
     if not items:
         return None
     total = 0.0
@@ -577,9 +578,6 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
 
 
 def shift_cell_ref(cell_ref: str, offset: int) -> str:
-    """
-    'F48' + 5 => 'F53'
-    """
     match = re.match(r"^([A-Z]+)(\d+)$", cell_ref)
     if not match:
         return cell_ref
@@ -595,10 +593,6 @@ def adjust_body_rows_preserve_footer(
     body_end: int = 47,
     extra_blank_rows: int = 3,
 ):
-    """
-    Preserve footer by inserting/deleting rows.
-    Returns row_offset.
-    """
     default_body_rows = body_end - body_start + 1
     total_body_rows_needed = sign_count + extra_blank_rows
     row_offset = total_body_rows_needed - default_body_rows
@@ -623,9 +617,6 @@ def approximate_autofit_rows(
     min_height: float = 15.0,
     chars_per_line: int = 50
 ) -> None:
-    """
-    Naive auto-fit for rows in text columns.
-    """
     for r in range(row_start, row_end + 1):
         max_lines = 1
         for col_letter in text_cols:
@@ -644,10 +635,6 @@ def apply_sheet_protection_for_selection(
     body_row_end: int,
     password: Optional[str] = None
 ) -> None:
-    """
-    CRITICAL: Must be the VERY LAST thing before saving - don't touch any cells after this!
-    Locks everything, then unlocks B-E in the body rows.
-    """
     lock_all_cells(ws, ws.max_row, ws.max_column)
     for r in range(body_row_start, body_row_end + 1):
         for c in ["B", "C", "D", "E"]:
@@ -677,40 +664,55 @@ def apply_sheet_protection_for_selection(
 
 
 # =========================================================
-# NEW: PDF Upload and Conversion Endpoint
+# PDF Upload and Conversion Endpoint (JSON only)
 # =========================================================
 @app.post("/convert-pdf")
 async def convert_pdf(file: UploadFile = File(...)):
-    """
-    Accept a PDF estimate file, extract data, and return JSON format
-    """
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="File must be a PDF")
     
-    # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
         content = await file.read()
         tmp_file.write(content)
         tmp_path = tmp_file.name
     
     try:
-        # Extract data from PDF
         extractor = EstimateExtractor(tmp_path)
         extractor.process_pdf()
-        
-        # Convert to JSON format
         json_data = extractor.to_json_format()
-        
         logging.info(f"Extracted {len(json_data['sign_types'])} sign items from PDF")
-        
         return JSONResponse({"success": True, "data": json_data})
-    
     except Exception as e:
         logging.exception("PDF extraction failed")
         raise HTTPException(status_code=500, detail=f"PDF extraction failed: {str(e)}")
-    
     finally:
-        # Clean up temporary file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+# =========================================================
+# NEW: URL-based PDF extraction endpoint (JSON only)
+# =========================================================
+@app.post("/convert-pdf-url")
+async def convert_pdf_url(req: PdfUrlRequest):
+    pdf_bytes = await _download_pdf_bytes(req.file_url)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(pdf_bytes)
+        tmp_path = tmp_file.name
+
+    try:
+        extractor = EstimateExtractor(tmp_path)
+        extractor.process_pdf()
+        json_data = extractor.to_json_format()
+        logging.info(f"Extracted {len(json_data['sign_types'])} sign items from PDF (via URL)")
+        return JSONResponse({"success": True, "data": json_data})
+    except Exception as e:
+        logging.exception("URL PDF extraction failed")
+        raise HTTPException(status_code=500, detail=f"URL PDF extraction failed: {str(e)}")
+    finally:
         try:
             os.unlink(tmp_path)
         except:
@@ -722,10 +724,6 @@ async def convert_pdf(file: UploadFile = File(...)):
 # =========================================================
 @app.post("/generate-proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(...)):
-    """
-    Original endpoint - accepts JSON payload
-    """
-    # Delete old outputs (older than 30 minutes)
     cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
 
     try:
@@ -740,41 +738,61 @@ def generate_proposal(payload: Dict[str, Any] = Body(...)):
 
 
 # =========================================================
-# NEW: Combined endpoint - PDF to Excel in one call
+# Combined endpoint - PDF upload -> Excel in one call
 # =========================================================
 @app.post("/pdf-to-excel")
 async def pdf_to_excel(file: UploadFile = File(...)):
-    """
-    Accept a PDF estimate file and directly generate an Excel proposal
-    """
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="File must be a PDF")
     
-    # Save uploaded file temporarily
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
         content = await file.read()
         tmp_file.write(content)
         tmp_path = tmp_file.name
     
     try:
-        # Extract data from PDF
         extractor = EstimateExtractor(tmp_path)
         extractor.process_pdf()
-        
-        # Convert to JSON format
         estimate_data = extractor.to_json_format()
-        
         logging.info(f"Extracted {len(estimate_data['sign_types'])} sign items from PDF")
-        
-        # Generate Excel
         return _generate_excel_from_data(estimate_data)
-    
     except Exception as e:
         logging.exception("PDF to Excel conversion failed")
         raise HTTPException(status_code=500, detail=f"Conversion failed: {str(e)}")
-    
     finally:
-        # Clean up temporary file
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
+
+
+# =========================================================
+# NEW: Combined endpoint - PDF URL -> Excel in one call
+# =========================================================
+@app.post("/pdf-to-excel-url")
+async def pdf_to_excel_url(req: PdfUrlRequest):
+    """
+    This endpoint exists for GPT Actions platforms that cannot reliably send multipart file uploads.
+    The GPT sends a file_url (JSON). Server downloads the PDF, parses it, generates Excel, returns download_url.
+    """
+    cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
+
+    pdf_bytes = await _download_pdf_bytes(req.file_url)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(pdf_bytes)
+        tmp_path = tmp_file.name
+
+    try:
+        extractor = EstimateExtractor(tmp_path)
+        extractor.process_pdf()
+        estimate_data = extractor.to_json_format()
+        logging.info(f"Extracted {len(estimate_data['sign_types'])} sign items from PDF (via URL)")
+        return _generate_excel_from_data(estimate_data)
+    except Exception as e:
+        logging.exception("URL PDF to Excel conversion failed")
+        raise HTTPException(status_code=500, detail=f"URL conversion failed: {str(e)}")
+    finally:
         try:
             os.unlink(tmp_path)
         except:
@@ -782,9 +800,6 @@ async def pdf_to_excel(file: UploadFile = File(...)):
 
 
 def _generate_excel_from_data(estimate_data: Dict[str, Any]):
-    """
-    Core logic to generate Excel from estimate data (extracted from original endpoint)
-    """
     if not os.path.exists(TEMPLATE_PATH):
         raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
 
@@ -801,19 +816,17 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
 
         insert_logo(ws)
 
-        # Capture template footer row heights BEFORE any insertion/deletion
         FOOTER_HEIGHT_START = 48
         FOOTER_HEIGHT_END = 120
         footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
 
-        # ---------------- Header mapping ----------------
+        # Header mapping
         write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
         write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
         write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
         write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
         write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
 
-        # ---------------- Sold-to / Ship-to ----------------
         sold_to = estimate_data.get("sold_to", {}) or {}
         ship_to = estimate_data.get("ship_to", {}) or {}
 
@@ -837,7 +850,6 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
         write_cell(ws, "C16", ship_csz)
         write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-        # ---------------- Dynamic body resize ----------------
         sign_types = estimate_data.get("sign_types", []) or []
         sign_count = len(sign_types)
 
@@ -856,7 +868,7 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
         total_body_rows_needed = sign_count + EXTRA_BLANK
         body_last_row = BODY_START + total_body_rows_needed - 1
         body_change_count = footer_row_offset - 5
-        # Add body change indicator in H3
+
         if body_change_count > 0:
             change_text = f"Add {body_change_count}"
         elif body_change_count < 0:
@@ -866,12 +878,10 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
         ws["H3"].value = change_text
         logging.info(f"Body row change: {change_text}")
 
-        # ---------------- Write sign lines ----------------
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
         current_row = BODY_START
         item_num = 1
 
-        # Track duplicates by sign code
         sign_code_counts: Dict[str, int] = {}
 
         for sign in sign_types:
@@ -893,7 +903,6 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
                 ws[f"{COL_QTY}{current_row}"].value = qty_val
                 ws[f"{COL_DESC}{current_row}"].value = desc_summary
                 ws[f"{COL_UNIT}{current_row}"].value = unit_val
-                # Total = Qty * Unit Price (formula)
                 if qty_val is not None and unit_val is not None:
                     ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
                 else:
@@ -904,13 +913,11 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
                 ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
                 unit_val = round_nearest_dollar(sign.get("unit_price"))
                 ws[f"{COL_UNIT}{current_row}"].value = unit_val
-                # No total for alternates
                 ws[f"{COL_TOTAL}{current_row}"].value = None
 
             current_row += 1
             item_num += 1
 
-        # ---------------- Totals (hard-coded cells shifted) ----------------
         totals = estimate_data.get("totals", {}) or {}
         grand_total = safe_num(totals.get("total"))
         shipping_total = sum_extended(estimate_data.get("shipping"))
@@ -921,24 +928,19 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
         INSTALL_CELL = "F53"
         TOTAL_CELL = "F54"
 
-        # Subtotal: Use SUM formula for all body rows in column F
         subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
         body_sum_range = f"F{BODY_START}:F{body_last_row}"
         ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
         
-        # Shipping: default to 0.00 if None or zero
         shipping_value = shipping_total if shipping_total else 0.00
         write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_value)
         
-        # Installation: default to 0.00 if None or zero
         install_value = install_total if install_total else 0.00
         write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_value)
         
-        # Grand total
         if grand_total is not None:
             write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
-        # ---------------- Row height adjustment below row 26 ----------------
         last_used_row = ws.max_row
         approximate_autofit_rows(
             ws,
@@ -948,16 +950,12 @@ def _generate_excel_from_data(estimate_data: Dict[str, Any]):
             min_height=15.0
         )
 
-        # Restore footer row heights to template values (shifted)
         restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
-        # ---------------- Selection rules (ONLY allow selecting B–E in body) ----------------
-        # CRITICAL: Must be the VERY LAST thing before saving - don't touch any cells after this!
         apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
         
         logging.info("About to save workbook - no more cell modifications after this point")
 
-        # ---------------- Save output workbook ----------------
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
@@ -994,7 +992,9 @@ def root():
         "service": "Boyd Sign Systems - Estimate Processor",
         "endpoints": {
             "/convert-pdf": "POST - Upload PDF, get JSON data",
+            "/convert-pdf-url": "POST - Send {file_url}, get JSON data",
             "/pdf-to-excel": "POST - Upload PDF, get Excel file directly",
+            "/pdf-to-excel-url": "POST - Send {file_url}, get Excel file directly",
             "/generate-proposal": "POST - Send JSON data, get Excel file"
         }
     }
