@@ -742,6 +742,19 @@ class UploadChunkRequestModel(BaseModel):
     index: int
     data_base64: str
 
+
+class UploadChunkBatchRequestModel(BaseModel):
+    upload_id: str
+    start_index: int = 0
+    chunks: List[str]
+
+class UploadChunkBatchResponseModel(BaseModel):
+    ok: bool
+    saved_start_index: int
+    saved_count: int
+    saved_bytes: int
+
+
 class UploadFinishRequestModel(BaseModel):
     upload_id: str
     filename: str
