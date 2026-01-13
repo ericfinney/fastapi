@@ -5,7 +5,6 @@ import logging
 import re
 import math
 import time
-from pathlib import Path
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -698,80 +697,91 @@ class UploadChunkRequestModel(BaseModel):
 class UploadFinishRequestModel(BaseModel):
     upload_id: str
     filename: str
-class UploadFinishResponseModel(BaseModel):
-    download_url: str
-    filename: str
-
-
-
-class UploadStatusRequestModel(BaseModel):
-    upload_id: str
-
-class UploadStatusResponseModel(BaseModel):
-    upload_id: str
-    chunk_count: int
-    max_index: Optional[int] = None
-    total_bytes: int
-
-class UploadChunkBatchRequestModel(BaseModel):
-    upload_id: str
-    start_index: int = Field(ge=0)
-    chunks: List[str]
-
-class UploadChunkBatchResponseModel(BaseModel):
-    ok: bool
-    saved_start_index: int
-    saved_count: int
-    saved_bytes: int
 
 def _upload_dir(upload_id: str) -> str:
     return os.path.join(UPLOAD_DIR, upload_id)
 
 def _decode_b64_any(b64_text: str) -> bytes:
-    """Decode base64 that may be missing padding or use urlsafe alphabet."""
+    """Decode a *complete* base64 string into bytes.
+
+    IMPORTANT: We only decode after reassembling ALL chunks. Individual chunks
+    are not required to be independently decodable (chunk size can be 200).
+    """
     if b64_text is None:
         raise ValueError("Missing base64 text")
-    s = re.sub(r"\s+", "", b64_text)
-    s = s.replace("-", "+").replace("_", "/")
-    pad = (-len(s)) % 4
-    if pad:
-        s += "=" * pad
-    return base64.b64decode(s, validate=False)
+
+    # Remove all whitespace/newlines defensively.
+    b64_clean = re.sub(r"\s+", "", b64_text)
+
+    # Some clients may use URL-safe base64; accept both alphabets.
+    # Fix padding for whole-string decode.
+    mod = len(b64_clean) % 4
+    if mod == 1:
+        raise ValueError("Invalid base64 length (mod 4 == 1)")
+    if mod == 2:
+        b64_clean += "=="
+    elif mod == 3:
+        b64_clean += "="
+
+    try:
+        return base64.urlsafe_b64decode(b64_clean.encode("ascii"))
+    except Exception:
+        # Fallback: standard decoder without strict validation (still safe here because we validate charset upstream).
+        return base64.b64decode(b64_clean.encode("ascii"), validate=False)
 
 
-def _list_chunk_files(folder: Path) -> list[tuple[int, Path]]:
-    out: list[tuple[int, Path]] = []
-    for p in folder.glob("*.b64"):
+_B64_RE = re.compile(r"^[A-Za-z0-9+/=_-]*$")
+
+
+def _validate_b64_fragment(fragment: str) -> None:
+    """Fail-fast validation for a base64 *fragment* (not necessarily padded)."""
+    if fragment is None:
+        raise ValueError("Missing data_base64")
+    if "\n" in fragment or "\r" in fragment or "\t" in fragment:
+        raise ValueError("Whitespace/newlines are not allowed in data_base64")
+    if not _B64_RE.match(fragment):
+        raise ValueError("Invalid characters in data_base64")
+
+
+def _chunk_path(upload_id: str, index: int) -> Path:
+    return _upload_dir(upload_id) / f"{index:08d}.b64"
+
+
+def _stitch_chunks_to_pdf(upload_id: str) -> bytes:
+    """Concatenate stored base64 fragments and decode once into PDF bytes."""
+    upload_dir = _upload_dir(upload_id)
+    if not upload_dir.exists():
+        raise FileNotFoundError("Upload not found")
+
+    chunk_files = sorted(upload_dir.glob("*.b64"))
+    if not chunk_files:
+        raise ValueError("No chunks uploaded")
+
+    # Ensure we have a contiguous 0..max_index set.
+    indices = []
+    for p in chunk_files:
         try:
-            idx = int(p.stem)
+            indices.append(int(p.stem))
         except Exception:
             continue
-        out.append((idx, p))
-    out.sort(key=lambda x: x[0])
-    return out
+    if not indices:
+        raise ValueError("No valid chunk files")
+
+    max_index = max(indices)
+    expected = set(range(0, max_index + 1))
+    missing = sorted(expected - set(indices))
+    if missing:
+        raise ValueError(f"Missing chunks: {missing[:10]}{'...' if len(missing) > 10 else ''}")
+
+    parts: list[str] = []
+    for i in range(0, max_index + 1):
+        frag = _chunk_path(upload_id, i).read_text(encoding="ascii")
+        parts.append(frag)
+
+    full_b64 = "".join(parts)
+    return _decode_b64_any(full_b64)
 
 
-def _reassemble_pdf_bytes(upload_id: str) -> bytes:
-    """Concatenate stored base64 chunk text and decode once."""
-    folder = _upload_dir(upload_id)
-    parts = _list_chunk_files(folder)
-    if not parts:
-        raise ValueError("No chunks found")
-    b64_all = "".join(p.read_text(encoding="ascii", errors="strict") for _, p in parts)
-    pdf_bytes = _decode_b64_any(b64_all)
-    if not pdf_bytes.startswith(b"%PDF"):
-        raise ValueError("Reassembled bytes do not look like a PDF (%PDF header missing)")
-    return pdf_bytes
-
-
-def _stitch_chunks_to_pdf(upload_id: str) -> str:
-    """Materialize reassembled PDF bytes to a temporary file and return its path."""
-    pdf_bytes = _reassemble_pdf_bytes(upload_id)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_bytes)
-        return tmp.name
-
-# Canonical
 @app.post("/pdf-upload/start", response_model=UploadInitResponseModel)
 def pdf_upload_start():
     upload_id = uuid.uuid4().hex
@@ -779,51 +789,153 @@ def pdf_upload_start():
     return UploadInitResponseModel(upload_id=upload_id)
 
 @app.post("/pdf-upload/chunk")
-def pdf_upload_chunk(req: UploadChunkRequestModel):
-    folder = _upload_dir(req.upload_id)
+async def pdf_upload_chunk(payload: UploadChunkRequestModel):
+    upload_id = payload.upload_id
+    index = int(payload.index)
+    data_base64 = payload.data_base64
 
-    # Store chunk as ASCII base64 text; decode only after concatenation in finish.
-    chunk_clean = re.sub(r"\s+", "", req.data_base64)
-    if not chunk_clean:
-        raise HTTPException(status_code=400, detail="Empty chunk data")
-    # Allow standard + urlsafe base64 alphabets plus '=' padding.
-    if not re.fullmatch(r"[A-Za-z0-9+/=_-]*", chunk_clean):
-        raise HTTPException(status_code=400, detail="Invalid characters in base64 chunk")
+    # Validate base64 fragment (can be any length; we decode only after reassembly).
+    _validate_b64_fragment(data_base64)
 
-    chunk_path = folder / f"{req.index}.b64"
-    chunk_path.write_text(chunk_clean, encoding="ascii")
+    upload_dir = _upload_dir(upload_id)
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
-    return UploadChunkResponseModel(ok=True, saved_index=req.index, saved_bytes=len(chunk_clean))
+    # Store fragments as ASCII text to avoid JSON/binary issues.
+    _chunk_path(upload_id, index).write_text(data_base64, encoding="ascii")
 
-@app.post("/pdf-upload/finish", response_model=UploadFinishResponseModel)
+    return {"ok": True, "saved_index": index, "saved_chars": len(data_base64)}
 
-def pdf_upload_finish(req: UploadFinishRequestModel):
-    cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
+@app.post("/pdf-upload/finish")
+async def pdf_upload_finish(payload: UploadFinishRequestModel):
+    upload_id = payload.upload_id
+    filename = payload.filename or "Boyd Proposal.xlsx"
 
-    pdf_path = _stitch_chunks_to_pdf(req.upload_id)
     try:
-        pdf_bytes = Path(pdf_path).read_bytes()
-        if len(pdf_bytes) < 1000 or not pdf_bytes.startswith(b"%PDF"):
-            raise HTTPException(status_code=400, detail="Reassembled file does not look like a valid PDF (missing/invalid chunks).")
+        pdf_bytes = _stitch_chunks_to_pdf(upload_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Reassembled file does not look like a valid PDF (missing/invalid chunks). ({e})")
 
-        text = extract_text_from_pdf(pdf_path)
-        estimate_data = parse_estimate_pdf_text_to_data(text)
+    # Very lightweight sanity check: PDF header
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Reassembled file does not look like a valid PDF (missing/invalid chunks).")
 
-        out_name, _ = build_proposal_workbook(estimate_data)
+    # Persist PDF to disk for downstream conversion.
+    upload_dir = _upload_dir(upload_id)
+    pdf_path = upload_dir / "uploaded.pdf"
+    pdf_path.write_bytes(pdf_bytes)
 
-        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
-        if not base_url:
-            base_url = "https://fastapi-production-37f6.up.railway.app"
-        download_url = f"{base_url}/download/{out_name}"
-        return JSONResponse({"download_url": download_url, "filename": out_name})
-    finally:
+    # Convert PDF -> Excel (existing helper).
+    try:
+        download_url, out_filename = await _convert_pdf_to_excel(pdf_path, filename)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")
+
+    return {"download_url": download_url, "filename": out_filename}
+
+# =================================================
+# Boyd Upload API v1.1 compatible routes (/upload/*)
+# =================================================
+
+class UploadInitResponseModel(BaseModel):
+    upload_id: str
+
+class UploadChunkResponseModel(BaseModel):
+    ok: bool
+    saved_index: int
+    saved_chars: int
+
+class UploadStatusRequestModel(BaseModel):
+    upload_id: str
+
+class UploadStatusResponseModel(BaseModel):
+    upload_id: str
+    chunk_count: int
+    max_index: int | None
+    total_chars: int
+
+class UploadChunkBatchRequestModel(BaseModel):
+    upload_id: str
+    start_index: int = Field(ge=0)
+    chunks: list[str]
+
+class UploadChunkBatchResponseModel(BaseModel):
+    ok: bool
+    saved_first_index: int
+    saved_last_index: int
+    saved_count: int
+    saved_chars: int
+
+
+@app.post("/upload/init", response_model=UploadInitResponseModel)
+async def upload_init():
+    resp = await pdf_upload_start()
+    return {"upload_id": resp["upload_id"]} if isinstance(resp, dict) else resp
+
+
+@app.post("/upload/chunk", response_model=UploadChunkResponseModel)
+async def upload_chunk(payload: UploadChunkRequestModel):
+    resp = await pdf_upload_chunk(payload)
+    return resp
+
+
+@app.post("/upload/chunk_batch", response_model=UploadChunkBatchResponseModel)
+async def upload_chunk_batch(payload: UploadChunkBatchRequestModel):
+    upload_id = payload.upload_id
+    start_index = int(payload.start_index)
+    chunks = payload.chunks or []
+
+    if not chunks:
+        raise HTTPException(status_code=400, detail="chunks must be a non-empty list")
+
+    total_chars = 0
+    for j, frag in enumerate(chunks):
+        idx = start_index + j
         try:
-            os.unlink(pdf_path)
-        except Exception:
-            pass
-        _cleanup_upload_id(req.upload_id)
+            _validate_b64_fragment(frag)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid characters in chunk_batch at index {idx}: {e}")
+        _chunk_path(upload_id, idx).write_text(frag, encoding="ascii")
+        total_chars += len(frag)
 
-# Compatibility aliases expected by your current OpenAPI
+    return {
+        "ok": True,
+        "saved_first_index": start_index,
+        "saved_last_index": start_index + len(chunks) - 1,
+        "saved_count": len(chunks),
+        "saved_chars": total_chars,
+    }
+
+
+@app.post("/upload/status", response_model=UploadStatusResponseModel)
+async def upload_status(payload: UploadStatusRequestModel):
+    upload_id = payload.upload_id
+    upload_dir = _upload_dir(upload_id)
+    if not upload_dir.exists():
+        raise HTTPException(status_code=404, detail="upload_id not found")
+
+    chunk_files = sorted(upload_dir.glob("*.b64"))
+    indices = []
+    total_chars = 0
+    for p in chunk_files:
+        try:
+            indices.append(int(p.stem))
+            total_chars += p.stat().st_size
+        except Exception:
+            continue
+
+    return {
+        "upload_id": upload_id,
+        "chunk_count": len(indices),
+        "max_index": max(indices) if indices else None,
+        "total_chars": total_chars,
+    }
+
+
+@app.post("/upload/finish")
+async def upload_finish(payload: UploadFinishRequestModel):
+    # Delegate to pdf-upload finish (same payload model: upload_id, filename)
+    return await pdf_upload_finish(payload)
+
 @app.post("/upload/init", response_model=UploadInitResponseModel)
 def upload_init_alias():
     return pdf_upload_start()
@@ -831,64 +943,6 @@ def upload_init_alias():
 @app.post("/upload/chunk")
 def upload_chunk_alias(req: UploadChunkRequestModel):
     return pdf_upload_chunk(req)
-
-@app.post("/upload/status", response_model=UploadStatusResponseModel)
-def upload_status(req: UploadStatusRequestModel):
-    folder = _upload_dir(req.upload_id)
-    parts = _list_chunk_files(folder)
-    if not parts:
-        raise HTTPException(status_code=404, detail="upload_id not found or no chunks uploaded")
-    total = 0
-    max_idx: Optional[int] = None
-    for idx, p in parts:
-        txt = p.read_text(encoding="ascii", errors="strict")
-        total += len(txt)
-        max_idx = idx
-    return UploadStatusResponseModel(
-        upload_id=req.upload_id,
-        chunk_count=len(parts),
-        max_index=max_idx,
-        total_bytes=total,
-    )
-
-
-@app.post("/upload/chunk_batch", response_model=UploadChunkBatchResponseModel)
-def upload_chunk_batch(req: UploadChunkBatchRequestModel):
-    folder = _upload_dir(req.upload_id)
-
-    idx = req.start_index
-    saved = 0
-
-    if not req.chunks:
-        raise HTTPException(status_code=400, detail="chunks must be non-empty")
-
-    for chunk in req.chunks:
-        chunk_clean = re.sub(r"\s+", "", chunk)
-        if not chunk_clean:
-            raise HTTPException(status_code=400, detail=f"Empty chunk at index {idx}")
-        if not re.fullmatch(r"[A-Za-z0-9+/=_-]*", chunk_clean):
-            raise HTTPException(status_code=400, detail=f"Invalid characters in chunk_batch at index {idx}")
-
-        (folder / f"{idx}.b64").write_text(chunk_clean, encoding="ascii")
-        saved += len(chunk_clean)
-        idx += 1
-
-    return UploadChunkBatchResponseModel(
-        ok=True,
-        saved_start_index=req.start_index,
-        saved_count=len(req.chunks),
-        saved_bytes=saved,
-    )
-
-
-# Backward-compatible aliases (older clients)
-@app.post("/pdf-upload/status", response_model=UploadStatusResponseModel)
-def upload_status_alias(req: UploadStatusRequestModel):
-    return upload_status(req)
-
-@app.post("/pdf-upload/chunk_batch", response_model=UploadChunkBatchResponseModel)
-def upload_chunk_batch_alias(req: UploadChunkBatchRequestModel):
-    return upload_chunk_batch(req)
 
 @app.post("/upload/finish")
 def upload_finish_alias(req: UploadFinishRequestModel):
