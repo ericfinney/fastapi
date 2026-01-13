@@ -868,9 +868,9 @@ class UploadChunkBatchResponseModel(BaseModel):
 
 
 @app.post("/upload/init", response_model=UploadInitResponseModel)
-async def upload_init():
-    resp = await pdf_upload_start()
-    return {"upload_id": resp["upload_id"]} if isinstance(resp, dict) else resp
+def upload_init():
+    resp = pdf_upload_start()
+    return {"upload_id": resp.upload_id} if hasattr(resp, 'upload_id') else resp
 
 
 @app.post("/upload/chunk", response_model=UploadChunkResponseModel)
@@ -937,17 +937,6 @@ async def upload_finish(payload: UploadFinishRequestModel):
     # Delegate to pdf-upload finish (same payload model: upload_id, filename)
     return await pdf_upload_finish(payload)
 
-@app.post("/upload/init", response_model=UploadInitResponseModel)
-def upload_init_alias():
-    return pdf_upload_start()
-
-@app.post("/upload/chunk")
-def upload_chunk_alias(req: UploadChunkRequestModel):
-    return pdf_upload_chunk(req)
-
-@app.post("/upload/finish")
-def upload_finish_alias(req: UploadFinishRequestModel):
-    return pdf_upload_finish(req)
 
 
 @app.get("/version")
