@@ -974,6 +974,50 @@ async def upload_finish(payload: UploadFinishRequestModel):
     return await pdf_upload_finish(payload)
 
 
+@app.post("/upload/simple")
+async def upload_simple(payload: Dict[str, Any] = Body(...)):
+    """
+    Simplified upload endpoint - accepts entire base64 PDF in one call.
+    Avoids chunking complexity.
+    
+    Request: {"pdf_base64": "<full base64>", "filename": "Boyd Proposal.xlsx"}
+    Response: {"download_url": "https://...", "filename": "..."}
+    """
+    pdf_base64 = payload.get("pdf_base64")
+    filename = payload.get("filename", "Boyd Proposal.xlsx")
+    
+    if not pdf_base64:
+        raise HTTPException(status_code=400, detail="Missing pdf_base64")
+    
+    # Clean whitespace
+    pdf_base64 = re.sub(r"\s+", "", pdf_base64)
+    
+    # Decode
+    try:
+        pdf_bytes = base64.b64decode(pdf_base64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64: {e}")
+    
+    # Verify PDF
+    if not pdf_bytes.startswith(b"%PDF"):
+        raise HTTPException(status_code=400, detail="Not a valid PDF file")
+    
+    # Save temp file
+    upload_id = uuid.uuid4().hex
+    upload_dir = _upload_dir(upload_id)
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = upload_dir / "uploaded.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    
+    # Convert
+    try:
+        download_url, out_filename = await _convert_pdf_to_excel(pdf_path, filename)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Conversion failed: {e}")
+    
+    return {"download_url": download_url, "filename": out_filename}
+
+
 
 @app.get("/version")
 async def version():
