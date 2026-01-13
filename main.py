@@ -217,7 +217,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
                 lower_desc = description.lower()
                 if ('installation' not in lower_desc and 
                     'packing' not in lower_desc and 
-                    'shipping' not lower_desc and
+                    'shipping' not in lower_desc and
                     'mobilization' not in lower_desc and
                     'permitting' not in lower_desc):
                     
