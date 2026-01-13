@@ -841,6 +841,30 @@ async def pdf_upload_finish(payload: UploadFinishRequestModel):
 
     return {"download_url": download_url, "filename": out_filename}
 
+
+async def _convert_pdf_to_excel(pdf_path: Path, desired_filename: str) -> Tuple[str, str]:
+    """
+    Convert uploaded PDF to Excel proposal.
+    Returns: (download_url, output_filename)
+    """
+    # Extract text from PDF
+    pdf_text = extract_text_from_pdf(str(pdf_path))
+    
+    # Parse to estimate data
+    estimate_data = parse_estimate_pdf_text_to_data(pdf_text)
+    
+    # Build the Excel proposal
+    out_name, out_path = build_proposal_workbook(estimate_data)
+    
+    # Generate download URL
+    base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
+    if not base_url:
+        base_url = "https://fastapi-testing-c2c5.up.railway.app"
+    
+    download_url = f"{base_url}/download/{out_name}"
+    
+    return download_url, out_name
+
 # =================================================
 # Boyd Upload API v1.1 compatible routes (/upload/*)
 # =================================================
