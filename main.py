@@ -534,8 +534,8 @@ def fix_sheet_protection_xml(xlsx_path: str, sheet_name: str = "Proposal"):
 # =========================================================
 # FastAPI endpoints
 # =========================================================
-@app.get("/")
-def root():
+@app.get("/health")
+def health_check():
     return {
         "status": "ok",
         "template_exists": os.path.exists(TEMPLATE_PATH),
