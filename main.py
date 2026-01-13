@@ -738,10 +738,18 @@ def _validate_b64_fragment(fragment: str) -> None:
     """Fail-fast validation for a base64 *fragment* (not necessarily padded)."""
     if fragment is None:
         raise ValueError("Missing data_base64")
-    if "\n" in fragment or "\r" in fragment or "\t" in fragment:
+    if " " in fragment or "\n" in fragment or "\r" in fragment or "\t" in fragment:
         raise ValueError("Whitespace/newlines are not allowed in data_base64")
     if not _B64_RE.match(fragment):
-        raise ValueError("Invalid characters in data_base64")
+        # Find the first invalid character for debugging
+        invalid_chars = []
+        for i, char in enumerate(fragment[:100]):  # Check first 100 chars
+            if not re.match(r"[A-Za-z0-9+/=_-]", char):
+                invalid_chars.append(f"pos {i}: '{char}' (ord {ord(char)})")
+                if len(invalid_chars) >= 3:
+                    break
+        error_detail = f"Invalid characters in data_base64: {', '.join(invalid_chars) if invalid_chars else 'unknown'}"
+        raise ValueError(error_detail)
 
 
 def _chunk_path(upload_id: str, index: int) -> Path:
