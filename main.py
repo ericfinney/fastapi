@@ -699,8 +699,8 @@ class UploadFinishRequestModel(BaseModel):
     upload_id: str
     filename: str
 
-def _upload_dir(upload_id: str) -> str:
-    return os.path.join(UPLOAD_DIR, upload_id)
+def _upload_dir(upload_id: str) -> Path:
+    return Path(UPLOAD_DIR) / upload_id
 
 def _decode_b64_any(b64_text: str) -> bytes:
     """Decode a *complete* base64 string into bytes.
@@ -786,7 +786,7 @@ def _stitch_chunks_to_pdf(upload_id: str) -> bytes:
 @app.post("/pdf-upload/start", response_model=UploadInitResponseModel)
 def pdf_upload_start():
     upload_id = uuid.uuid4().hex
-    os.makedirs(_upload_dir(upload_id), exist_ok=True)
+    _upload_dir(upload_id).mkdir(parents=True, exist_ok=True)
     return UploadInitResponseModel(upload_id=upload_id)
 
 @app.post("/pdf-upload/chunk")
