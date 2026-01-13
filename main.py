@@ -804,6 +804,175 @@ async def web_interface():
 
 
 # PDF Parsing Function
+
+def generate_excel_from_data(estimate_data: dict, output_path: str):
+    """
+    Generate Excel proposal from estimate data.
+    Extracted from original generate_proposal route.
+    """
+    if not os.path.exists(TEMPLATE_PATH):
+        raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
+
+    wb = load_workbook(TEMPLATE_PATH)
+    if SHEET_NAME not in wb.sheetnames:
+        raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
+    ws = wb[SHEET_NAME]
+    
+    ws.protection.sheet = False
+    logging.info("Disabled template sheet protection (preserving settings)")
+
+    insert_logo(ws)
+
+    FOOTER_HEIGHT_START = 48
+    FOOTER_HEIGHT_END = 120
+    footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
+
+    # Header mapping
+    write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
+    write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
+    write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
+    write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
+    write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
+
+    # Sold-to / Ship-to
+    sold_to = estimate_data.get("sold_to", {}) or {}
+    ship_to = estimate_data.get("ship_to", {}) or {}
+
+    write_cell(ws, "D11", safe_str(sold_to.get("name")))
+    write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
+    sold_csz = " ".join([p for p in [
+        safe_str(sold_to.get("city")),
+        safe_str(sold_to.get("state")),
+        safe_str(sold_to.get("zip"))
+    ] if p.strip()])
+    write_cell(ws, "D16", sold_csz)
+    write_cell(ws, "D17", safe_str(sold_to.get("phone")))
+
+    write_cell(ws, "C11", safe_str(ship_to.get("name")))
+    write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
+    ship_csz = " ".join([p for p in [
+        safe_str(ship_to.get("city")),
+        safe_str(ship_to.get("state")),
+        safe_str(ship_to.get("zip"))
+    ] if p.strip()])
+    write_cell(ws, "C16", ship_csz)
+    write_cell(ws, "C17", safe_str(ship_to.get("phone")))
+
+    # Dynamic body resize
+    sign_types = estimate_data.get("sign_types", []) or []
+    sign_count = len(sign_types)
+
+    BODY_START = 28
+    BODY_END = 47
+    EXTRA_BLANK = 3
+
+    footer_row_offset = adjust_body_rows_preserve_footer(
+        ws,
+        sign_count=sign_count,
+        body_start=BODY_START,
+        body_end=BODY_END,
+        extra_blank_rows=EXTRA_BLANK
+    )
+
+    total_body_rows_needed = sign_count + EXTRA_BLANK
+    body_last_row = BODY_START + total_body_rows_needed - 1
+    body_change_count = footer_row_offset - 5
+    
+    if body_change_count > 0:
+        change_text = f"Add {body_change_count}"
+    elif body_change_count < 0:
+        change_text = f"Subtract {body_change_count}"
+    else:
+        change_text = "No Change"
+    ws["H3"].value = change_text
+    logging.info(f"Body row change: {change_text}")
+
+    # Write sign lines
+    COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
+    current_row = BODY_START
+    item_num = 1
+
+    sign_code_counts: Dict[str, int] = {}
+
+    for sign in sign_types:
+        ws[f"{COL_ITEM}{current_row}"].value = item_num
+
+        raw_type = safe_str(sign.get("sign_type"))
+        clean_type, summary = split_sign_type_and_summary(raw_type)
+
+        sign_code_counts.setdefault(clean_type, 0)
+        sign_code_counts[clean_type] += 1
+        occurrence = sign_code_counts[clean_type]
+
+        desc_summary = summary.strip() if summary else safe_str(sign.get("description")).strip()
+
+        if occurrence == 1:
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
+            qty_val = safe_num(sign.get("qty"))
+            unit_val = round_nearest_dollar(sign.get("unit_price"))
+            ws[f"{COL_QTY}{current_row}"].value = qty_val
+            ws[f"{COL_DESC}{current_row}"].value = desc_summary
+            ws[f"{COL_UNIT}{current_row}"].value = unit_val
+            if qty_val is not None and unit_val is not None:
+                ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
+            else:
+                ws[f"{COL_TOTAL}{current_row}"].value = None
+        else:
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
+            ws[f"{COL_QTY}{current_row}"].value = None
+            ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
+            unit_val = round_nearest_dollar(sign.get("unit_price"))
+            ws[f"{COL_UNIT}{current_row}"].value = unit_val
+            ws[f"{COL_TOTAL}{current_row}"].value = None
+
+        current_row += 1
+        item_num += 1
+
+    # Totals
+    totals = estimate_data.get("totals", {}) or {}
+    grand_total = safe_num(totals.get("total"))
+    shipping_total = sum_extended(estimate_data.get("shipping"))
+    install_total = sum_extended(estimate_data.get("installation"))
+
+    SUBTOTAL_CELL = "F48"
+    SHIPPING_CELL = "F49"
+    INSTALL_CELL = "F53"
+    TOTAL_CELL = "F54"
+
+    subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
+    body_sum_range = f"F{BODY_START}:F{body_last_row}"
+    ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
+    
+    shipping_value = shipping_total if shipping_total else 0.00
+    write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_value)
+    
+    install_value = install_total if install_total else 0.00
+    write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_value)
+    
+    if grand_total is not None:
+        write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
+
+    # Row height adjustment
+    last_used_row = ws.max_row
+    approximate_autofit_rows(
+        ws,
+        row_start=27,
+        row_end=last_used_row,
+        text_cols=["C"],
+        min_height=15.0
+    )
+
+    restore_row_heights(ws, footer_row_heights, footer_row_offset)
+
+    # Selection rules
+    apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
+    
+    logging.info("About to save workbook")
+
+    # Save
+    wb.save(output_path)
+
+
 def parse_boyd_estimate_from_text(text: str) -> dict:
     """Parse Boyd estimate PDF text into structured JSON data."""
     lines = [line for line in text.split('\n')]
@@ -955,7 +1124,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         
         # Call existing generate_proposal_internal function
-        generate_proposal_internal(estimate_data, output_path)
+        generate_excel_from_data(estimate_data, output_path)
         
         # Return download URL
         base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
