@@ -738,17 +738,21 @@ def _validate_b64_fragment(fragment: str) -> None:
     """Fail-fast validation for a base64 *fragment* (not necessarily padded)."""
     if fragment is None:
         raise ValueError("Missing data_base64")
+    
+    # Log fragment info for debugging
+    logging.info(f"Validating fragment: length={len(fragment)}, first_50={fragment[:50] if fragment else 'None'}")
+    
     if " " in fragment or "\n" in fragment or "\r" in fragment or "\t" in fragment:
         raise ValueError("Whitespace/newlines are not allowed in data_base64")
     if not _B64_RE.match(fragment):
         # Find the first invalid character for debugging
         invalid_chars = []
-        for i, char in enumerate(fragment[:100]):  # Check first 100 chars
+        for i, char in enumerate(fragment[:200]):  # Check first 200 chars
             if not re.match(r"[A-Za-z0-9+/=_-]", char):
                 invalid_chars.append(f"pos {i}: '{char}' (ord {ord(char)})")
-                if len(invalid_chars) >= 3:
+                if len(invalid_chars) >= 5:
                     break
-        error_detail = f"Invalid characters in data_base64: {', '.join(invalid_chars) if invalid_chars else 'unknown'}"
+        error_detail = f"Invalid characters in data_base64 (len={len(fragment)}): {', '.join(invalid_chars) if invalid_chars else 'unknown - regex failed but no invalid chars found in first 200'}"
         raise ValueError(error_detail)
 
 
