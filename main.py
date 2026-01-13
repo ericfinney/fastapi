@@ -5,12 +5,13 @@ import logging
 import re
 import math
 import time
+from pathlib import Path
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
 
 
 import base64
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 from fastapi import FastAPI, Body, HTTPException
@@ -697,6 +698,10 @@ class UploadChunkRequestModel(BaseModel):
 class UploadFinishRequestModel(BaseModel):
     upload_id: str
     filename: str
+class UploadFinishResponseModel(BaseModel):
+    download_url: str
+    filename: str
+
 
 
 class UploadStatusRequestModel(BaseModel):
