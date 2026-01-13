@@ -83,6 +83,18 @@ def safe_num(x):
     except Exception:
         return None
 
+def sum_extended(items_list):
+    """Sum the 'extended' field from a list of item dictionaries."""
+    if not items_list:
+        return None
+    total = 0.0
+    for item in items_list:
+        if isinstance(item, dict):
+            ext = safe_num(item.get("extended"))
+            if ext is not None:
+                total += ext
+    return total if total > 0 else None
+
 def round_up_dollars(value):
     if value is None or value == "":
         return None
