@@ -12,7 +12,8 @@ from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
-from fastapi import FastAPI, Body, HTTPException, HTMLResponse
+from fastapi import FastAPI, Body, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.responses import FileResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
