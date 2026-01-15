@@ -19,12 +19,23 @@ from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Protection
 
+from pydantic import BaseModel
+from pypdf import PdfReader
+import base64
+from io import BytesIO
+from pathlib import Path
+
 logging.basicConfig(level=logging.INFO)
 
 TEMPLATE_PATH = os.environ.get("BOYD_TEMPLATE_PATH", "templates/Blank.xlsx")
 SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
+
+# If a PDF is huge, we switch to streaming parsing (page-by-page) automatically.
+# You can tune these:
+MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40"))
+MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -40,16 +51,8 @@ def cleanup_old_generated_workbooks(
     filename_prefix: str = "Boyd_Proposal_",
     allowed_exts: Tuple[str, ...] = (".xlsx", ".xlsm"),
 ) -> None:
-    """
-    Deletes generated proposal files older than N minutes.
-    Safe-guards:
-      - Only deletes files starting with filename_prefix
-      - Only deletes allowed_exts
-      - Only deletes regular files
-    """
     if not os.path.isdir(directory):
         return
-
     now = time.time()
     max_age_sec = older_than_minutes * 60
 
@@ -87,25 +90,7 @@ def safe_num(x):
     except Exception:
         return None
 
-def round_up_dollars(value):
-    """
-    Always round UP to the next whole dollar.
-    12.00 -> 12
-    12.01 -> 13
-    """
-    if value is None or value == "":
-        return None
-    try:
-        return math.ceil(float(value))
-    except Exception:
-        return None
-
 def round_nearest_dollar(value):
-    """
-    Round to nearest whole dollar using standard rounding.
-    12.49 -> 12
-    12.50 -> 13
-    """
     if value is None or value == "":
         return None
     try:
@@ -120,9 +105,6 @@ def write_cell(ws, cell: str, value):
     ws[cell].value = value
 
 def insert_logo(ws):
-    """
-    Reinserts logo at A1 every time. Pillow must be installed.
-    """
     if not os.path.exists(LOGO_PATH):
         logging.warning("Logo not found at %s; skipping insert.", LOGO_PATH)
         return
@@ -140,9 +122,6 @@ def unlock_cell(ws, cell_ref: str):
     ws[cell_ref].protection = Protection(locked=False)
 
 def lock_all_cells(ws, max_row: int, max_col: int) -> None:
-    """
-    Lock all cells in a rectangular region.
-    """
     for r in range(1, max_row + 1):
         for c in range(1, max_col + 1):
             ws.cell(row=r, column=c).protection = Protection(locked=True)
@@ -164,15 +143,12 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 
 
 # =========================================================
-# Sign type + summary split (ROBUST)
+# Sign type + summary split (for Excel display only)
+# JSON retains sign_type EXACTLY as in PDF.
 # =========================================================
 TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
 
 def looks_like_sign_code(code: str) -> bool:
-    """
-    Allow commas/spaces like: "E5.P&P, D/F"
-    Keep guardrails to avoid splitting normal sentences.
-    """
     if not code:
         return False
     c = code.strip()
@@ -184,14 +160,15 @@ def looks_like_sign_code(code: str) -> bool:
         return False
     return True
 
-def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
+def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
     """
-    Splits the FIRST dash separator into:
-      (sign_type_code, summary_text)
+    For Excel layout only:
+      If "CODE - Summary" -> ("CODE", "Summary")
+      Otherwise -> ("", raw)
     """
-    if not raw_sign_type:
+    if not raw:
         return "", ""
-    s = str(raw_sign_type).strip()
+    s = str(raw).strip()
     if not s:
         return "", ""
 
@@ -202,7 +179,7 @@ def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
         if looks_like_sign_code(code):
             return code, summary
 
-    return s, ""
+    return "", s
 
 
 # =========================================================
@@ -363,12 +340,10 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
 # Selection control: ONLY allow selecting body B–E
 # =========================================================
 def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
-    # 1) Unlock B–E directly
     for r in range(body_row_start, body_row_end + 1):
         for col in ("B", "C", "D", "E"):
             unlock_cell(ws, f"{col}{r}")
 
-    # 2) Unlock top-left of merged ranges that intersect (rows body) and (cols B–E)
     for rng in ws.merged_cells.ranges:
         min_row, max_row = rng.min_row, rng.max_row
         min_col, max_col = rng.min_col, rng.max_col
@@ -381,104 +356,11 @@ def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
 
 
 def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: int) -> None:
-    logging.info(f"Applying sheet protection for body rows {body_row_start} to {body_row_end}")
-
     max_row = max(ws.max_row, body_row_end + 5)
     max_col = max(ws.max_column, 6)
-    logging.info(f"Locking all cells up to row {max_row}, col {max_col}")
     lock_all_cells(ws, max_row=max_row, max_col=max_col)
-
-    logging.info(f"Unlocking body cells B-E in rows {body_row_start}-{body_row_end}")
     unlock_body_selection(ws, body_row_start, body_row_end)
-
-    test_cells = [f"B{body_row_start}", f"C{body_row_start}", f"D{body_row_start}", f"E{body_row_start}", f"A{body_row_start}", f"F{body_row_start}"]
-    for cell_ref in test_cells:
-        locked = ws[cell_ref].protection.locked
-        logging.info(f"BEFORE protection - Cell {cell_ref} locked status: {locked}")
-
-    logging.info("Re-enabling sheet protection (preserving template EnableSelection setting)")
     ws.protection.sheet = True
-
-    logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
-    for cell_ref in test_cells:
-        locked = ws[cell_ref].protection.locked
-        logging.info(f"AFTER protection - Cell {cell_ref} locked status: {locked}")
-
-
-def fix_sheet_protection_xml(xlsx_path: str, sheet_name: str = "Proposal"):
-    """
-    Post-process the Excel file to fix sheet protection XML.
-    openpyxl doesn't save selectLockedCells/selectUnlockedCells correctly,
-    so we manually edit the XML.
-    """
-    temp_dir = tempfile.mkdtemp()
-
-    try:
-        with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-
-        workbook_xml = os.path.join(temp_dir, 'xl', 'workbook.xml')
-        tree = ET.parse(workbook_xml)
-        root = tree.getroot()
-
-        ns = {'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
-        sheet_id = None
-        for sheet in root.findall('.//main:sheet', ns):
-            if sheet.get('name') == sheet_name:
-                sheet_id = sheet.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
-                break
-
-        if not sheet_id:
-            logging.warning(f"Could not find sheet '{sheet_name}' in workbook XML")
-            return
-
-        rels_file = os.path.join(temp_dir, 'xl', '_rels', 'workbook.xml.rels')
-        rels_tree = ET.parse(rels_file)
-        rels_root = rels_tree.getroot()
-
-        sheet_file = None
-        rels_ns = {'rel': 'http://schemas.openxmlformats.org/package/2006/relationships'}
-        for rel in rels_root.findall('.//rel:Relationship', rels_ns):
-            if rel.get('Id') == sheet_id:
-                sheet_file = rel.get('Target')
-                break
-
-        if not sheet_file:
-            logging.warning(f"Could not find sheet file for sheet ID '{sheet_id}'")
-            return
-
-        sheet_xml_path = os.path.join(temp_dir, 'xl', sheet_file)
-        sheet_tree = ET.parse(sheet_xml_path)
-        sheet_root = sheet_tree.getroot()
-
-        protection = sheet_root.find('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheetProtection')
-
-        if protection is not None:
-            if 'selectLockedCells' in protection.attrib:
-                del protection.attrib['selectLockedCells']
-
-            protection.set('selectUnlockedCells', '1')
-
-            logging.info("Updated sheetProtection XML: removed selectLockedCells, set selectUnlockedCells=1")
-
-            sheet_tree.write(sheet_xml_path, encoding='utf-8', xml_declaration=True)
-
-            with zipfile.ZipFile(xlsx_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
-                for root_dir, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        file_path = os.path.join(root_dir, file)
-                        arc_name = os.path.relpath(file_path, temp_dir)
-                        zip_ref.write(file_path, arc_name)
-
-            logging.info(f"Successfully fixed sheet protection XML in {xlsx_path}")
-        else:
-            logging.warning("No sheetProtection element found in XML")
-
-    except Exception as e:
-        logging.error(f"Failed to fix sheet protection XML: {e}")
-
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # =========================================================
@@ -498,6 +380,9 @@ def health_check():
 
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Action endpoint: expects {"payload": "<JSON string>"} exactly.
+    """
     logging.info("Incoming request: payload keys = %s", list(payload.keys()) if payload else None)
 
     if not payload or "payload" not in payload:
@@ -517,159 +402,11 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
 
     try:
-        wb = load_workbook(TEMPLATE_PATH)
-        if SHEET_NAME not in wb.sheetnames:
-            raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
-        ws = wb[SHEET_NAME]
-
-        ws.protection.sheet = False
-        logging.info("Disabled template sheet protection (preserving settings)")
-
-        insert_logo(ws)
-
-        FOOTER_HEIGHT_START = 48
-        FOOTER_HEIGHT_END = 120
-        footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
-
-        write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
-        write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
-        write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
-        write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
-        write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
-
-        sold_to = estimate_data.get("sold_to", {}) or {}
-        ship_to = estimate_data.get("ship_to", {}) or {}
-
-        write_cell(ws, "D11", safe_str(sold_to.get("name")))
-        write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
-        sold_csz = " ".join([p for p in [
-            safe_str(sold_to.get("city")),
-            safe_str(sold_to.get("state")),
-            safe_str(sold_to.get("zip"))
-        ] if p.strip()])
-        write_cell(ws, "D16", sold_csz)
-        write_cell(ws, "D17", safe_str(sold_to.get("phone")))
-
-        write_cell(ws, "C11", safe_str(ship_to.get("name")))
-        write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
-        ship_csz = " ".join([p for p in [
-            safe_str(ship_to.get("city")),
-            safe_str(ship_to.get("state")),
-            safe_str(ship_to.get("zip"))
-        ] if p.strip()])
-        write_cell(ws, "C16", ship_csz)
-        write_cell(ws, "C17", safe_str(ship_to.get("phone")))
-
-        sign_types = estimate_data.get("sign_types", []) or []
-        sign_count = len(sign_types)
-
-        BODY_START = 28
-        BODY_END = 47
-        EXTRA_BLANK = 3
-
-        footer_row_offset = adjust_body_rows_preserve_footer(
-            ws,
-            sign_count=sign_count,
-            body_start=BODY_START,
-            body_end=BODY_END,
-            extra_blank_rows=EXTRA_BLANK
-        )
-
-        total_body_rows_needed = sign_count + EXTRA_BLANK
-        body_last_row = BODY_START + total_body_rows_needed - 1
-        body_change_count = footer_row_offset - 5
-
-        if body_change_count > 0:
-            change_text = f"Add {body_change_count}"
-        elif body_change_count < 0:
-            change_text = f"Subtract {body_change_count}"
-        else:
-            change_text = "No Change"
-        ws["H3"].value = change_text
-        logging.info(f"Body row change: {change_text}")
-
-        COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
-        current_row = BODY_START
-        item_num = 1
-
-        sign_code_counts: Dict[str, int] = {}
-
-        for sign in sign_types:
-            ws[f"{COL_ITEM}{current_row}"].value = item_num
-
-            raw_type = safe_str(sign.get("sign_type"))
-            clean_type, summary = split_sign_type_and_summary(raw_type)
-
-            sign_code_counts.setdefault(clean_type, 0)
-            sign_code_counts[clean_type] += 1
-            occurrence = sign_code_counts[clean_type]
-
-            desc_summary = summary.strip() if summary else safe_str(sign.get("description")).strip()
-
-            if occurrence == 1:
-                ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
-                qty_val = safe_num(sign.get("qty"))
-                unit_val = round_nearest_dollar(sign.get("unit_price"))
-                ws[f"{COL_QTY}{current_row}"].value = qty_val
-                ws[f"{COL_DESC}{current_row}"].value = desc_summary
-                ws[f"{COL_UNIT}{current_row}"].value = unit_val
-                if qty_val is not None and unit_val is not None:
-                    ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
-                else:
-                    ws[f"{COL_TOTAL}{current_row}"].value = None
-            else:
-                ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-                ws[f"{COL_QTY}{current_row}"].value = None
-                ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
-                unit_val = round_nearest_dollar(sign.get("unit_price"))
-                ws[f"{COL_UNIT}{current_row}"].value = unit_val
-                ws[f"{COL_TOTAL}{current_row}"].value = None
-
-            current_row += 1
-            item_num += 1
-
-        totals = estimate_data.get("totals", {}) or {}
-        grand_total = safe_num(totals.get("total"))
-        shipping_total = sum_extended(estimate_data.get("shipping"))
-        install_total = sum_extended(estimate_data.get("installation"))
-
-        SUBTOTAL_CELL = "F48"
-        SHIPPING_CELL = "F49"
-        INSTALL_CELL = "F53"
-        TOTAL_CELL = "F54"
-
-        subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
-        body_sum_range = f"F{BODY_START}:F{body_last_row}"
-        ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
-
-        shipping_value = shipping_total if shipping_total else 0.00
-        write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_value)
-
-        install_value = install_total if install_total else 0.00
-        write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_value)
-
-        if grand_total is not None:
-            write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
-
-        last_used_row = ws.max_row
-        approximate_autofit_rows(
-            ws,
-            row_start=27,
-            row_end=last_used_row,
-            text_cols=["C"],
-            min_height=15.0
-        )
-
-        restore_row_heights(ws, footer_row_heights, footer_row_offset)
-
-        apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
-
-        logging.info("About to save workbook - no more cell modifications after this point")
-
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
-        wb.save(out_path)
+
+        generate_excel_from_data(estimate_data, out_path)
 
     except HTTPException:
         raise
@@ -699,14 +436,8 @@ def download_file(filename: str):
 
 
 # =============================================================================
-# WEB INTERFACE AND PDF PARSING - Added for direct PDF upload
+# WEB INTERFACE AND PDF PARSING
 # =============================================================================
-from pydantic import BaseModel
-from pypdf import PdfReader
-import base64
-from io import BytesIO
-from pathlib import Path
-
 class GenerateFromPdfRequest(BaseModel):
     pdf_base64: str
     filename: str = "estimate.pdf"
@@ -714,29 +445,22 @@ class GenerateFromPdfRequest(BaseModel):
 
 @app.get("/", response_class=HTMLResponse)
 async def web_interface():
-    """Serve the HTML upload interface"""
     html_path = Path(__file__).parent / "templates" / "upload.html"
-
     if not html_path.exists():
         return """
-        <html>
-        <body>
+        <html><body>
         <h1>Boyd Proposal Generator</h1>
-        <p>Web interface not found. Use the API endpoint directly:</p>
-        <pre>POST /generate_proposal</pre>
-        </body>
-        </html>
+        <p>Use POST /generate_proposal_from_pdf</p>
+        </body></html>
         """
-
     with open(html_path) as f:
         return f.read()
 
 
+# =============================================================================
+# Excel generation (updated to align with JSON schema in your instructions)
+# =============================================================================
 def generate_excel_from_data(estimate_data: dict, output_path: str):
-    """
-    Generate Excel proposal from estimate data.
-    Extracted from original generate_proposal route.
-    """
     if not os.path.exists(TEMPLATE_PATH):
         raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
 
@@ -746,15 +470,13 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     ws = wb[SHEET_NAME]
 
     ws.protection.sheet = False
-    logging.info("Disabled template sheet protection (preserving settings)")
-
     insert_logo(ws)
 
     FOOTER_HEIGHT_START = 48
     FOOTER_HEIGHT_END = 120
     footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
 
-    # Header mapping
+    # Header fields (leave empty if missing)
     write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
     write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
     write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
@@ -785,7 +507,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     write_cell(ws, "C16", ship_csz)
     write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-    # Dynamic body resize
+    # Main sign table
     sign_types = estimate_data.get("sign_types", []) or []
     sign_count = len(sign_types)
 
@@ -803,61 +525,44 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
     total_body_rows_needed = sign_count + EXTRA_BLANK
     body_last_row = BODY_START + total_body_rows_needed - 1
-    body_change_count = footer_row_offset - 5
 
-    if body_change_count > 0:
-        change_text = f"Add {body_change_count}"
-    elif body_change_count < 0:
-        change_text = f"Subtract {body_change_count}"
-    else:
-        change_text = "No Change"
-    ws["H3"].value = change_text
-    logging.info(f"Body row change: {change_text}")
-
-    # Write sign lines
     COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
     current_row = BODY_START
     item_num = 1
 
-    sign_code_counts: Dict[str, int] = {}
-
     for sign in sign_types:
+        raw_line = safe_str(sign.get("sign_type"))
+        qty_val = safe_num(sign.get("qty"))
+        unit_val = safe_num(sign.get("unit_price"))
+
+        # Excel formatting: try to split CODE - Summary for display only.
+        code, summary = split_sign_type_and_summary(raw_line)
+
         ws[f"{COL_ITEM}{current_row}"].value = item_num
+        ws[f"{COL_QTY}{current_row}"].value = qty_val
+        ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
 
-        raw_type = safe_str(sign.get("sign_type"))
-        clean_type, summary = split_sign_type_and_summary(raw_type)
-
-        sign_code_counts.setdefault(clean_type, 0)
-        sign_code_counts[clean_type] += 1
-        occurrence = sign_code_counts[clean_type]
-
-        desc_summary = summary.strip() if summary else safe_str(sign.get("description")).strip()
-
-        if occurrence == 1:
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = clean_type
-            qty_val = safe_num(sign.get("qty"))
-            unit_val = round_nearest_dollar(sign.get("unit_price"))
-            ws[f"{COL_QTY}{current_row}"].value = qty_val
-            ws[f"{COL_DESC}{current_row}"].value = desc_summary
-            ws[f"{COL_UNIT}{current_row}"].value = unit_val
-            if qty_val is not None and unit_val is not None:
-                ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
-            else:
-                ws[f"{COL_TOTAL}{current_row}"].value = None
+        if code:
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
+            ws[f"{COL_DESC}{current_row}"].value = summary
         else:
+            # If we can't confidently split, keep EXACT line in description to preserve "as listed".
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-            ws[f"{COL_QTY}{current_row}"].value = None
-            ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
-            unit_val = round_nearest_dollar(sign.get("unit_price"))
-            ws[f"{COL_UNIT}{current_row}"].value = unit_val
+            ws[f"{COL_DESC}{current_row}"].value = raw_line
+
+        # Let Excel compute line total from qty*unit, but totals section is trusted from PDF separately.
+        if qty_val is not None and unit_val is not None:
+            ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
+        else:
             ws[f"{COL_TOTAL}{current_row}"].value = None
 
         current_row += 1
         item_num += 1
 
-    # Totals
+    # Totals section: trust PDF totals if present
     totals = estimate_data.get("totals", {}) or {}
     grand_total = safe_num(totals.get("total"))
+
     shipping_total = sum_extended(estimate_data.get("shipping"))
     install_total = sum_extended(estimate_data.get("installation"))
 
@@ -870,71 +575,63 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     body_sum_range = f"F{BODY_START}:F{body_last_row}"
     ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
 
-    shipping_value = shipping_total if shipping_total else 0.00
-    write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_value)
-
-    install_value = install_total if install_total else 0.00
-    write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_value)
+    # Dedicated sections: push totals into dedicated cells
+    write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_total if shipping_total is not None else 0.00)
+    write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_total if install_total is not None else 0.00)
 
     if grand_total is not None:
         write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
     # Row height adjustment
     last_used_row = ws.max_row
-    approximate_autofit_rows(
-        ws,
-        row_start=27,
-        row_end=last_used_row,
-        text_cols=["C"],
-        min_height=15.0
-    )
-
+    approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
     restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
-    # Selection rules
     apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
-
-    logging.info("About to save workbook")
 
     wb.save(output_path)
 
 
 # =============================================================================
-# PDF parsing (with section parser + fallback global scanner)
+# PDF parsing matching your GPT instructions
 # =============================================================================
 
-# More forgiving line-item regexes
-LINE_ITEM_RE_STRICT_COLUMNS = re.compile(
+# Common Boyd estimate line-item structure: description  qty  unit  extended
+LINE_ITEM_RE = re.compile(
     r'^\s*(.+?)\s{2,}(\d+(?:\.\d+)?)\s{2,}\$?\s*([\d,]+(?:\.\d{2})?)\s{2,}\$?\s*([\d,]+(?:\.\d{2})?)\s*$'
 )
-LINE_ITEM_RE_LOOSE = re.compile(
-    r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d{2})?)\s+\$?\s*([\d,]+(?:\.\d{2})?)\s*$'
-)
 
-EXCLUDE_DESC_TOKENS = (
-    "installation",
-    "install",
-    "packing",
-    "shipping",
-    "freight",
-    "mobilization",
-    "permit",
-    "permitting",
-    "tax",
-)
+MONEY_RE = re.compile(r'\$?\s*([\d,]+(?:\.\d{2})?)')
+
+# Section detectors (case-insensitive, tolerant)
+SECTION_SIGNAGE_RE = re.compile(r'\bSIGNAGE\s+PACKAGE\b', re.I)
+SECTION_SIGNAGE_SAMPLES_RE = re.compile(r'\bSIGNAGE\s+SAMPLES\s+PACKAGE\b', re.I)
+
+SECTION_SHIPPING_RE = re.compile(r'\bSHIPPING\b', re.I)
+SECTION_INSTALL_RE = re.compile(r'\bINSTALL(?:ATION)?\b', re.I)
+
+# Totals lines
+SUBTOTAL_RE = re.compile(r'\bSUB[- ]?TOTAL\b', re.I)
+MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
+TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
+
+# Header-ish fields
+DATE_RE = re.compile(r'\bDate\s+(\d{1,2}/\d{1,2}/\d{2,4})\b', re.I)
+PROJECT_ID_RE = re.compile(r'\bProject\s+Id\s*:\s*(\S+)\b', re.I)
+PROJECT_DESC_RE = re.compile(r'\bProject\s+Desc\.?\s*:\s*(.+?)\s*(?:Ship\s+Via|$)', re.I)
+SALESPERSON_RE = re.compile(r'\bSalesperson\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
+PM_RE = re.compile(r'\bProject\s+Manager\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
+PE_RE = re.compile(r'\bProject\s+Engineer\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
 
 def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     """
-    Try to parse a single PDF-extracted text line into:
-      description, qty, unit_price, extended
-    Returns None if not parseable.
+    Strictly extract from the PDF line.
+    Do not reject based on heuristics. Do not “fix” values.
+    Missing/unparseable -> None.
     """
     if not line or not line.strip():
         return None
-
-    m = LINE_ITEM_RE_STRICT_COLUMNS.match(line)
-    if not m:
-        m = LINE_ITEM_RE_LOOSE.match(line)
+    m = LINE_ITEM_RE.match(line)
     if not m:
         return None
 
@@ -943,213 +640,298 @@ def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     unit_raw = m.group(3).strip().replace(",", "")
     ext_raw = m.group(4).strip().replace(",", "")
 
-    try:
-        qty = float(qty_raw)
-        # many times qty is an integer, but keep float safe
-        if abs(qty - int(qty)) < 1e-9:
-            qty = int(qty)
-        unit_price = float(unit_raw)
-        extended = float(ext_raw)
-    except Exception:
-        return None
+    qty = safe_num(qty_raw)
+    if qty is not None and abs(qty - int(qty)) < 1e-9:
+        qty = int(qty)
 
-    # Filter out non-sign items by keyword
-    lower_desc = description.lower()
-    if any(tok in lower_desc for tok in EXCLUDE_DESC_TOKENS):
-        return None
-
-    # Optional sanity: extended should be close-ish to qty*unit (some PDFs include rounding/markup)
-    # If it's wildly off, skip.
-    try:
-        expected = float(qty) * float(unit_price)
-        if expected > 0 and abs(extended - expected) / expected > 0.50:
-            # more than 50% off is suspicious; ignore
-            return None
-    except Exception:
-        pass
-
-    clean_type, summary = split_sign_type_and_summary(description)
+    unit_price = safe_num(unit_raw)
+    extended_total = safe_num(ext_raw)
 
     return {
-        "sign_type": clean_type or description,
-        "description": summary or description,
+        "description": description,
         "qty": qty,
         "unit_price": unit_price,
-        "extended": extended,
+        "extended_total": extended_total,
     }
 
-def _dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen = set()
-    out = []
-    for it in items:
-        key = (
-            safe_str(it.get("sign_type")).strip(),
-            safe_str(it.get("description")).strip(),
-            str(it.get("qty")),
-            f"{safe_num(it.get('unit_price')) or 0:.4f}",
-            f"{safe_num(it.get('extended')) or 0:.4f}",
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-    return out
+def _extract_money(line: str) -> Optional[float]:
+    m = MONEY_RE.search(line or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except Exception:
+        return None
 
-def parse_boyd_estimate_from_text(text: str) -> dict:
-    """Parse Boyd estimate PDF text into structured JSON data."""
-    lines = [line for line in (text or "").split("\n")]
-
-    data = {
+def _init_data() -> Dict[str, Any]:
+    """
+    Per your instructions: missing values are "" or null.
+    """
+    return {
         "estimate_date": "",
         "project_id": "",
         "project_description": "",
         "salesperson": "",
         "project_manager": "",
         "project_engineer": "",
-        "sold_to": {},
-        "ship_to": {},
-        "sign_types": [],
-        "shipping": [],
-        "installation": [],
-        "totals": {"sub_total": 0.0, "mark_up": 0.0, "total": 0.0}
+        "sold_to": {
+            "name": "",
+            "address_lines": [],
+            "city": "",
+            "state": "",
+            "zip": "",
+            "phone": ""
+        },
+        "ship_to": {
+            "name": "",
+            "address_lines": [],
+            "city": "",
+            "state": "",
+            "zip": "",
+            "phone": ""
+        },
+        "sign_types": [],       # (sign_type, qty, unit_price, extended_total)
+        "shipping": [],         # (description, qty, unit_price, extended_total, notes)
+        "installation": [],     # (description, qty, unit_price, extended_total, notes)
+        "totals": {
+            "sub_total": None,
+            "mark_up": None,
+            "total": None
+        }
     }
 
-    # Extract header-ish info (best-effort)
-    for line in lines:
-        if 'Date' in line and not data['estimate_date']:
-            match = re.search(r'Date\s+(\d{1,2}/\d{1,2}/\d{2,4})', line)
-            if match:
-                data['estimate_date'] = match.group(1)
+def _apply_header_extraction(data: Dict[str, Any], line: str):
+    if not data["estimate_date"]:
+        m = DATE_RE.search(line)
+        if m:
+            data["estimate_date"] = m.group(1)
 
-        if 'Project Id' in line:
-            match = re.search(r'Project Id\s*:\s*(\S+)', line)
-            if match:
-                data['project_id'] = match.group(1)
+    if not data["project_id"]:
+        m = PROJECT_ID_RE.search(line)
+        if m:
+            data["project_id"] = m.group(1)
 
-        if 'Project Desc' in line:
-            match = re.search(r'Project Desc\.?\s*:\s*(.+?)(?:Ship Via|$)', line)
-            if match:
-                data['project_description'] = match.group(1).strip()
+    if not data["project_description"]:
+        m = PROJECT_DESC_RE.search(line)
+        if m:
+            data["project_description"] = m.group(1).strip()
 
-        if 'Salesperson' in line and ':' in line and not data["salesperson"]:
-            match = re.search(r'Salesperson\s*:\s*(.+?)(?:\s{2,}|$)', line)
-            if match:
-                data['salesperson'] = match.group(1).strip()
+    if not data["salesperson"]:
+        m = SALESPERSON_RE.search(line)
+        if m:
+            data["salesperson"] = m.group(1).strip()
 
-        if 'Project Manager:' in line and not data["project_manager"]:
-            match = re.search(r'Project Manager:\s*(.+?)(?:Project|$)', line)
-            if match:
-                data['project_manager'] = match.group(1).strip()
+    if not data["project_manager"]:
+        m = PM_RE.search(line)
+        if m:
+            data["project_manager"] = m.group(1).strip()
 
-        if 'Project Engineer:' in line and not data["project_engineer"]:
-            match = re.search(r'Project Engineer:\s*(.+?)(?:REQUESTED|$)', line)
-            if match:
-                data['project_engineer'] = match.group(1).strip()
+    if not data["project_engineer"]:
+        m = PE_RE.search(line)
+        if m:
+            data["project_engineer"] = m.group(1).strip()
 
-    # --------------------------
-    # 1) Primary: parse items inside "SIGNAGE PACKAGE" section
-    # --------------------------
-    in_signage_package = False
-    section_items: List[Dict[str, Any]] = []
+def _apply_totals_extraction(data: Dict[str, Any], line: str):
+    if data["totals"]["sub_total"] is None and SUBTOTAL_RE.search(line):
+        data["totals"]["sub_total"] = _extract_money(line)
 
-    for line in lines:
-        # stop early at totals section
-        if re.search(r'\bSUB[- ]?TOTAL\b', line, re.I):
-            break
+    if data["totals"]["mark_up"] is None and MARKUP_RE.search(line):
+        data["totals"]["mark_up"] = _extract_money(line)
 
-        # section toggles (case-insensitive)
-        if re.search(r'\bSIGNAGE\s+SAMPLES\s+PACKAGE\b', line, re.I):
-            in_signage_package = False
+    # TOTAL can appear multiple times; prefer the first parsable "TOTAL" line
+    if data["totals"]["total"] is None and TOTAL_RE.search(line):
+        data["totals"]["total"] = _extract_money(line)
+
+def _section_from_line(current: str, line: str) -> str:
+    """
+    Determine active section based on headings.
+    We avoid keyword heuristics on individual items and instead rely on headings.
+    """
+    # Explicit signage samples end signage parsing
+    if SECTION_SIGNAGE_SAMPLES_RE.search(line):
+        return "other"
+
+    # Signage package
+    if SECTION_SIGNAGE_RE.search(line) and not re.search(r'\bSAMPLES\b', line, re.I):
+        return "signage"
+
+    # Shipping section heading
+    # (Some estimates label it as SHIPPING PACKAGE or lines with SHIPPING + columns)
+    if re.search(r'\bSHIPPING\s+PACKAGE\b', line, re.I) or re.search(r'^\s*SHIPPING\b', line, re.I):
+        return "shipping"
+
+    # Installation section heading
+    if re.search(r'\bINSTALL(?:ATION)?\s+PACKAGE\b', line, re.I) or re.search(r'^\s*INSTALL(?:ATION)?\b', line, re.I):
+        return "installation"
+
+    # If we hit totals, stop sections
+    if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
+        return "totals"
+
+    return current
+
+def parse_boyd_estimate_from_text(text: str) -> dict:
+    """
+    Full parse (non-streaming): best when PDF is moderate sized.
+    """
+    data = _init_data()
+    lines = [line for line in (text or "").split("\n")]
+
+    section = "other"
+    for raw in lines:
+        line = raw.strip("\r")
+
+        # header fields best-effort
+        _apply_header_extraction(data, line)
+
+        # totals best-effort
+        _apply_totals_extraction(data, line)
+
+        # section transitions
+        section = _section_from_line(section, line)
+
+        # parse line items in known sections
+        parsed = _parse_line_item(line)
+        if not parsed:
             continue
 
-        if re.search(r'\bSIGNAGE\s+PACKAGE\b', line, re.I) and not re.search(r'\bSAMPLES\b', line, re.I):
-            in_signage_package = True
-            continue
+        if section == "signage":
+            # IMPORTANT: include sign type exactly as listed.
+            data["sign_types"].append({
+                "sign_type": parsed["description"],
+                "qty": parsed["qty"],
+                "unit_price": parsed["unit_price"],
+                "extended_total": parsed["extended_total"],
+            })
+        elif section == "shipping":
+            data["shipping"].append({
+                "description": parsed["description"],
+                "qty": parsed["qty"],
+                "unit_price": parsed["unit_price"],
+                "extended_total": parsed["extended_total"],
+                "notes": ""
+            })
+        elif section == "installation":
+            data["installation"].append({
+                "description": parsed["description"],
+                "qty": parsed["qty"],
+                "unit_price": parsed["unit_price"],
+                "extended_total": parsed["extended_total"],
+                "notes": ""
+            })
+        else:
+            # Outside known sections, do nothing.
+            # This prevents the fallback from mis-bucketing shipping/install into sign types.
+            pass
 
-        if in_signage_package:
+    return data
+
+def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
+    """
+    Fallback mode for very large PDFs:
+      - processes page-by-page
+      - does NOT concatenate all text
+      - still respects sections
+    """
+    data = _init_data()
+    section = "other"
+
+    for page in reader.pages:
+        page_text = page.extract_text() or ""
+        for raw in page_text.split("\n"):
+            line = raw.strip("\r")
+
+            _apply_header_extraction(data, line)
+            _apply_totals_extraction(data, line)
+
+            section = _section_from_line(section, line)
+
             parsed = _parse_line_item(line)
-            if parsed:
-                section_items.append(parsed)
-
-    section_items = _dedupe_items(section_items)
-
-    # --------------------------
-    # 2) Fallback: scan entire document for line items
-    # --------------------------
-    fallback_items: List[Dict[str, Any]] = []
-    if not section_items:
-        logging.info("No items found in SIGNAGE PACKAGE section; running fallback global scan.")
-        for line in lines:
-            # skip obvious headers and totals-ish lines
-            if re.search(r'\bSUB[- ]?TOTAL\b|\bMARK[- ]?UP\b|\bTOTAL\b', line, re.I):
-                continue
-            if re.search(r'\bSIGNAGE\b\s+\bPACKAGE\b', line, re.I):
+            if not parsed:
                 continue
 
-            parsed = _parse_line_item(line)
-            if parsed:
-                fallback_items.append(parsed)
-
-        fallback_items = _dedupe_items(fallback_items)
-
-    items = section_items if section_items else fallback_items
-    data["sign_types"] = items
-
-    # Extract totals (best-effort)
-    for i, line in enumerate(lines):
-        if re.search(r'\bSUB[- ]?TOTAL\b', line, re.I):
-            m = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', line)
-            if m:
-                data['totals']['sub_total'] = float(m.group(1).replace(',', ''))
-
-        if re.search(r'\bMARK[- ]?UP\b', line, re.I):
-            m = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', line)
-            if m:
-                data['totals']['mark_up'] = float(m.group(1).replace(',', ''))
-
-        # TOTAL sometimes appears on same line with a dollar amount
-        if re.search(r'^\s*TOTAL\b', line, re.I):
-            m = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', line)
-            if m:
-                data['totals']['total'] = float(m.group(1).replace(',', ''))
-            else:
-                # sometimes amount is on previous line
-                if i > 0:
-                    pm = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', lines[i-1])
-                    if pm:
-                        data['totals']['total'] = float(pm.group(1).replace(',', ''))
+            if section == "signage":
+                data["sign_types"].append({
+                    "sign_type": parsed["description"],
+                    "qty": parsed["qty"],
+                    "unit_price": parsed["unit_price"],
+                    "extended_total": parsed["extended_total"],
+                })
+            elif section == "shipping":
+                data["shipping"].append({
+                    "description": parsed["description"],
+                    "qty": parsed["qty"],
+                    "unit_price": parsed["unit_price"],
+                    "extended_total": parsed["extended_total"],
+                    "notes": ""
+                })
+            elif section == "installation":
+                data["installation"].append({
+                    "description": parsed["description"],
+                    "qty": parsed["qty"],
+                    "unit_price": parsed["unit_price"],
+                    "extended_total": parsed["extended_total"],
+                    "notes": ""
+                })
 
     return data
 
 
-# Combined PDF Upload and Processing Endpoint
+# =============================================================================
+# PDF Upload and Processing Endpoint
+# =============================================================================
 @app.post("/generate_proposal_from_pdf")
 async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
-    """Upload PDF, extract text, parse data, generate Excel."""
+    """
+    Upload PDF, extract text, parse data, generate Excel.
+    Includes fallback streaming parsing for large PDFs.
+    """
     try:
-        logging.info(f"Processing PDF: {request.filename}")
+        logging.info("Processing PDF: %s", request.filename)
 
         pdf_bytes = base64.b64decode(request.pdf_base64)
         pdf_file = BytesIO(pdf_bytes)
         reader = PdfReader(pdf_file)
 
-        text_parts = []
-        for page in reader.pages:
-            page_text = page.extract_text() or ""
-            text_parts.append(page_text)
-        text = "\n".join(text_parts) + "\n"
+        num_pages = len(reader.pages)
+        logging.info("PDF pages: %d", num_pages)
 
-        logging.info(f"Extracted {len(text)} characters from {len(reader.pages)} pages")
+        # Decide parsing mode:
+        # - If many pages, use streaming fallback.
+        # - Else try full extraction; if extracted text is too large, switch to streaming.
+        use_streaming = num_pages >= MAX_PDF_PAGES_STREAMING
 
-        estimate_data = parse_boyd_estimate_from_text(text)
+        estimate_data = None
 
-        items_count = len(estimate_data.get('sign_types', []))
-        logging.info(f"Parsed {items_count} line items")
+        if use_streaming:
+            logging.info("Using streaming parser (page-by-page) due to page count.")
+            estimate_data = parse_boyd_estimate_streaming(reader)
+        else:
+            # full extraction
+            text_parts = []
+            total_chars = 0
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                total_chars += len(t)
+                text_parts.append(t)
+                if total_chars > MAX_EXTRACTED_TEXT_CHARS:
+                    logging.info("Extracted text exceeds %d chars; switching to streaming fallback.", MAX_EXTRACTED_TEXT_CHARS)
+                    estimate_data = parse_boyd_estimate_streaming(reader)
+                    break
+
+            if estimate_data is None:
+                text = "\n".join(text_parts) + "\n"
+                estimate_data = parse_boyd_estimate_from_text(text)
+
+        items_count = len(estimate_data.get("sign_types", []))
+        logging.info("Parsed sign line items: %d", items_count)
+        logging.info("Parsed shipping items: %d", len(estimate_data.get("shipping", [])))
+        logging.info("Parsed installation items: %d", len(estimate_data.get("installation", [])))
 
         if items_count == 0:
             raise HTTPException(
                 status_code=400,
-                detail="No line items found in PDF. Please check the PDF format."
+                detail="No sign line items found in PDF (SIGNAGE PACKAGE section not detected or no parseable rows)."
             )
 
         cleanup_old_generated_workbooks(OUTPUT_DIR)
@@ -1171,13 +953,13 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
             "filename": output_filename,
             "download_url": download_url,
             "items_count": items_count,
-            "project_id": estimate_data.get('project_id', 'N/A'),
-            "total": estimate_data.get('totals', {}).get('total', 0)
+            "project_id": estimate_data.get("project_id", ""),
+            "total": estimate_data.get("totals", {}).get("total", None),
+            "used_streaming_fallback": use_streaming or False
         }
 
     except HTTPException:
-        # ✅ Preserve deliberate 4xx errors (like "no line items")
         raise
     except Exception as e:
-        logging.error(f"Error processing PDF: {e}", exc_info=True)
+        logging.error("Error processing PDF: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
