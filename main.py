@@ -10,7 +10,6 @@ import tempfile
 import shutil
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
-from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
@@ -31,7 +30,7 @@ SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
 
-# Fallback mode for big PDFs:
+# If a PDF is huge, switch to streaming parsing (page-by-page).
 MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
@@ -142,7 +141,7 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 
 # =========================================================
 # Sign type + summary split (Excel display only)
-# JSON keeps sign_type EXACTLY as PDF.
+# JSON keeps sign_type EXACTLY as PDF (for real sign lines and header lines).
 # =========================================================
 TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
 
@@ -159,6 +158,11 @@ def looks_like_sign_code(code: str) -> bool:
     return True
 
 def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
+    """
+    For Excel layout only:
+      If "CODE - Summary" -> ("CODE", "Summary")
+      Otherwise -> ("", raw)
+    """
     if not raw:
         return "", ""
     s = str(raw).strip()
@@ -370,6 +374,9 @@ def health_check():
 
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Action endpoint: expects {"payload": "<JSON string>"} exactly.
+    """
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
@@ -390,9 +397,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
-
         generate_excel_from_data(estimate_data, out_path)
-
     except HTTPException:
         raise
     except Exception as e:
@@ -401,7 +406,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
     base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
     if not base_url:
-        base_url = "https://fastapi-production-37f6.up.railway.app"
+        base_url = "http://localhost:8000"
 
     download_url = f"{base_url}/download/{out_name}"
     return JSONResponse({"download_url": download_url, "filename": out_name})
@@ -512,6 +517,8 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         qty_val = safe_num(sign.get("qty"))
         unit_val = safe_num(sign.get("unit_price"))
 
+        # Excel display: "CODE - Summary" -> column B and C
+        # For section headers like "BLDG. 03 'WELLNESS' SIGN PACKAGE", code won't match, so it goes to description cell.
         code, summary = split_sign_type_and_summary(raw_line)
 
         ws[f"{COL_ITEM}{current_row}"].value = item_num
@@ -564,15 +571,16 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
 
 # =============================================================================
-# PDF parsing updated for THIS estimate format
+# PDF parsing updated for this estimate format + generic section headers as line items
 # =============================================================================
 
 # Accept: description qty $ unit $ extended
 # - spacing can be 1+ spaces
 # - unit/extended decimals can be any length (114.1538)
 # - commas supported
+# - allow NO space before the second $ (handles some PDF text variants)
 LINE_ITEM_RE = re.compile(
-    r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*$'
+    r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*$'
 )
 
 MONEY_RE = re.compile(r'\$?\s*([\d,]+(?:\.\d+)?)')
@@ -581,16 +589,24 @@ SUBTOTAL_RE = re.compile(r'\bSUB[- ]?TOTAL\b', re.I)
 MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
 TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
-# IMPORTANT: Your estimate uses "SIGN PACKAGE" (not "SIGNAGE PACKAGE")
-SIGNAGE_LIKE_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b', re.I)   # matches SIGN PACKAGE or SIGNAGE PACKAGE
+# Table header appears each page
 SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s+Type\s*&\s+Overall\b', re.I)
 
+# Generic sign package headers (your docs show lines like "BLDG. 03 'WELLNESS' SIGN PACKAGE") :contentReference[oaicite:3]{index=3}
+SIGN_PACKAGE_HEADER_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
+
+# Page 1 header fields
 DATE_RE = re.compile(r'\bDate\s+(\d{1,2}/\d{1,2}/\d{2,4})\b', re.I)
 PROJECT_ID_RE = re.compile(r'\bProject\s+Id\s*:\s*(\S+)\b', re.I)
 PROJECT_DESC_RE = re.compile(r'\bProject\s+Desc\.?\s*:\s*(.+?)\s*(?:Ship\s+Via|$)', re.I)
-SALESPERSON_RE = re.compile(r'\bSalesperson\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
-PM_RE = re.compile(r'\bProject\s+Manager\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
-PE_RE = re.compile(r'\bProject\s+Engineer\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
+
+SALESPERSON_RE = re.compile(r'\bSalesperson\s*:\s*(.+)$', re.I)
+SALES_REP_RE = re.compile(r'\bSales\s+Rep\s*:\s*(.+)$', re.I)
+
+PM_RE = re.compile(r'\bProject\s+Manager\s*:\s*(.+)$', re.I)
+PE_RE = re.compile(r'\bProject\s+Engineer\s*:\s*(.+)$', re.I)
+
+CITY_STATE_ZIP_RE = re.compile(r'([A-Za-z .\'&/-]+)\s*,\s*([A-Z]{2})\s*(\d{5})(?:-\d{4})?')
 
 def _init_data() -> Dict[str, Any]:
     return {
@@ -617,6 +633,23 @@ def _extract_money(line: str) -> Optional[float]:
     except Exception:
         return None
 
+def _clean_person_value(raw: str) -> str:
+    """
+    Stops at the next known field label if the PDF flattens multiple labels onto one line.
+    """
+    if not raw:
+        return ""
+    s = raw.strip()
+    for stop in [
+        "Project Manager:", "Project Engineer:", "REQUESTED BY:",
+        "Project Id", "Project Desc", "Ship Via", "Terms", "P.O. Number",
+        "Sign Type &", "Estimate", "Date"
+    ]:
+        idx = s.find(stop)
+        if idx != -1:
+            s = s[:idx].strip()
+    return s
+
 def _apply_header_extraction(data: Dict[str, Any], line: str):
     if not data["estimate_date"]:
         m = DATE_RE.search(line)
@@ -636,17 +669,21 @@ def _apply_header_extraction(data: Dict[str, Any], line: str):
     if not data["salesperson"]:
         m = SALESPERSON_RE.search(line)
         if m:
-            data["salesperson"] = m.group(1).strip()
+            data["salesperson"] = _clean_person_value(m.group(1))
+        else:
+            m2 = SALES_REP_RE.search(line)
+            if m2:
+                data["salesperson"] = _clean_person_value(m2.group(1))
 
     if not data["project_manager"]:
         m = PM_RE.search(line)
         if m:
-            data["project_manager"] = m.group(1).strip()
+            data["project_manager"] = _clean_person_value(m.group(1))
 
     if not data["project_engineer"]:
         m = PE_RE.search(line)
         if m:
-            data["project_engineer"] = m.group(1).strip()
+            data["project_engineer"] = _clean_person_value(m.group(1))
 
 def _apply_totals_extraction(data: Dict[str, Any], line: str):
     if data["totals"]["sub_total"] is None and SUBTOTAL_RE.search(line):
@@ -661,8 +698,7 @@ def _apply_totals_extraction(data: Dict[str, Any], line: str):
 def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     """
     Only parse summary rows with prices.
-    Require a '$' to avoid parsing dimension/component lines like:
-      "Backer Panel 6.00 6.00 .125 1"
+    Require a '$' to avoid parsing dimension/component lines.
     """
     if not line or not line.strip():
         return None
@@ -681,6 +717,7 @@ def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     qty = safe_num(qty_raw)
     if qty is not None and abs(qty - int(qty)) < 1e-9:
         qty = int(qty)
+
     unit_price = safe_num(unit_raw)
     extended_total = safe_num(ext_raw)
 
@@ -691,38 +728,150 @@ def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
         "extended_total": extended_total,
     }
 
+def _split_two_columns_by_street_numbers(line: str) -> Tuple[str, str]:
+    """
+    PDF text often flattens two columns into one line:
+      "86 Inverness Place North 1600 West 12th Street"
+    Split at the 2nd street-number token.
+    """
+    if not line:
+        return "", ""
+    matches = list(re.finditer(r'\b\d{1,5}\s', line))
+    if len(matches) >= 2:
+        cut = matches[1].start()
+        left = line[:cut].strip()
+        right = line[cut:].strip()
+        return left, right
+    return line.strip(), ""
+
+def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
+    """
+    Extract sold_to and ship_to blocks from page-1 style header.
+    """
+    if not lines:
+        return
+
+    idx = None
+    sold_name = ship_name = ""
+    for i, raw in enumerate(lines[:50]):
+        line = raw.strip()
+        m = re.search(r'\bTo:\s*(.*?)\s+Ship\s+To:\s*(.+)$', line, re.I)
+        if m:
+            sold_name = m.group(1).strip()
+            ship_name = m.group(2).strip()
+            idx = i
+            break
+
+    if idx is None:
+        return
+
+    if sold_name and not data["sold_to"].get("name"):
+        data["sold_to"]["name"] = sold_name
+    if ship_name and not data["ship_to"].get("name"):
+        data["ship_to"]["name"] = ship_name
+
+    if idx + 1 < len(lines):
+        addr_line = lines[idx + 1].strip()
+        left_addr, right_addr = _split_two_columns_by_street_numbers(addr_line)
+
+        if left_addr:
+            data["sold_to"]["address_lines"] = data["sold_to"].get("address_lines", []) or []
+            if left_addr not in data["sold_to"]["address_lines"]:
+                data["sold_to"]["address_lines"].append(left_addr)
+
+        if right_addr:
+            data["ship_to"]["address_lines"] = data["ship_to"].get("address_lines", []) or []
+            if right_addr not in data["ship_to"]["address_lines"]:
+                data["ship_to"]["address_lines"].append(right_addr)
+
+    if idx + 2 < len(lines):
+        csz_line = lines[idx + 2].strip()
+        csz = CITY_STATE_ZIP_RE.findall(csz_line)
+        if csz:
+            if len(csz) >= 1:
+                city, state, z = csz[0]
+                if not data["sold_to"].get("city"): data["sold_to"]["city"] = city.strip()
+                if not data["sold_to"].get("state"): data["sold_to"]["state"] = state.strip()
+                if not data["sold_to"].get("zip"): data["sold_to"]["zip"] = z.strip()
+            if len(csz) >= 2:
+                city, state, z = csz[1]
+                if not data["ship_to"].get("city"): data["ship_to"]["city"] = city.strip()
+                if not data["ship_to"].get("state"): data["ship_to"]["state"] = state.strip()
+                if not data["ship_to"].get("zip"): data["ship_to"]["zip"] = z.strip()
+
+    for raw in lines[idx:idx + 15]:
+        line = raw.strip()
+        if re.search(r'\bPhone\b', line, re.I):
+            phone = re.sub(r'^\s*Phone\s*', '', line, flags=re.I).strip()
+            if phone and not data["sold_to"].get("phone"):
+                data["sold_to"]["phone"] = phone
+            break
+
+def _append_sign_section_header_if_needed(data: Dict[str, Any], header_line: str, last_header: Optional[str]) -> str:
+    """
+    Treat a SIGN PACKAGE header line as its own line item:
+      sign_type = header text (exactly)
+      qty/unit/extended = None
+    This makes it appear in the proposal table with the whole line in the description cell.
+    """
+    hdr = (header_line or "").strip()
+    if not hdr:
+        return last_header or ""
+
+    # avoid duplicates if PDF repeats the same header across pages
+    if last_header and hdr == last_header:
+        return last_header
+
+    data["sign_types"].append({
+        "sign_type": hdr,
+        "qty": None,
+        "unit_price": None,
+        "extended_total": None
+    })
+    return hdr
+
 def _section_from_line(current: str, line: str) -> str:
-    # If we hit totals, stop parsing sections
+    # Totals stop parsing
     if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
         return "totals"
 
-    # Shipping / Installation headings (keep your originals)
+    # Shipping / Installation headings
     if re.search(r'\bSHIPPING\s+PACKAGE\b', line, re.I) or re.search(r'^\s*SHIPPING\b', line, re.I):
         return "shipping"
     if re.search(r'\bINSTALL(?:ATION)?\s+PACKAGE\b', line, re.I) or re.search(r'^\s*INSTALL(?:ATION)?\b', line, re.I):
         return "installation"
 
-    # Signage/sign package headings:
-    # Your pages have "SIGN PACKAGE" and also repeat the table header on each page.
-    if SIGNAGE_LIKE_RE.search(line):
-        return "signage"
+    # The repeating table header indicates we are in the sign table
     if SIGN_TABLE_HEADER_RE.search(line):
-        # Treat the start of the table as signage section unless we're explicitly in shipping/install
+        # don't override if explicitly in shipping/install tables
         if current not in ("shipping", "installation"):
             return "signage"
+
+    # A generic sign package header line indicates sign section too
+    if SIGN_PACKAGE_HEADER_RE.search(line):
+        return "signage"
 
     return current
 
 def parse_boyd_estimate_from_text(text: str) -> dict:
     data = _init_data()
     section = "other"
+    last_sign_header = ""
+
     lines = [line for line in (text or "").split("\n")]
+    _apply_sold_ship_extraction(data, lines)
 
     for raw in lines:
         line = raw.strip("\r")
 
         _apply_header_extraction(data, line)
         _apply_totals_extraction(data, line)
+
+        # Detect section header lines that should become their own sign line item
+        if SIGN_PACKAGE_HEADER_RE.search(line.strip()) and section != "shipping" and section != "installation":
+            section = "signage"
+            last_sign_header = _append_sign_section_header_if_needed(data, line, last_sign_header)
+            continue
 
         section = _section_from_line(section, line)
 
@@ -732,7 +881,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
 
         if section == "signage":
             data["sign_types"].append({
-                "sign_type": parsed["description"],   # exact as listed
+                "sign_type": parsed["description"],  # exact as listed
                 "qty": parsed["qty"],
                 "unit_price": parsed["unit_price"],
                 "extended_total": parsed["extended_total"],
@@ -759,14 +908,25 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
 def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
     data = _init_data()
     section = "other"
+    last_sign_header = ""
 
-    for page in reader.pages:
+    for page_index, page in enumerate(reader.pages):
         page_text = page.extract_text() or ""
-        for raw in page_text.split("\n"):
+        page_lines = page_text.split("\n")
+
+        if page_index == 0:
+            _apply_sold_ship_extraction(data, page_lines)
+
+        for raw in page_lines:
             line = raw.strip("\r")
 
             _apply_header_extraction(data, line)
             _apply_totals_extraction(data, line)
+
+            if SIGN_PACKAGE_HEADER_RE.search(line.strip()) and section != "shipping" and section != "installation":
+                section = "signage"
+                last_sign_header = _append_sign_section_header_if_needed(data, line, last_sign_header)
+                continue
 
             section = _section_from_line(section, line)
 
@@ -839,7 +999,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
                 estimate_data = parse_boyd_estimate_from_text(text)
 
         items_count = len(estimate_data.get("sign_types", []))
-        logging.info("Parsed sign line items: %d", items_count)
+        logging.info("Parsed sign line items (including section headers): %d", items_count)
 
         if items_count == 0:
             raise HTTPException(
@@ -857,7 +1017,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
 
         base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
         if not base_url:
-            base_url = "https://fastapi-testing-c2c5.up.railway.app/"
+            base_url = "http://fastapi-testing-c2c5.up.railway.app"
 
         download_url = f"{base_url}/download/{output_filename}"
 
