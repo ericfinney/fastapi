@@ -944,7 +944,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
 
         base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
         if not base_url:
-            base_url = "http://localhost:8000"
+            base_url = "http://fastapi-testing-c2c5.up.railway.app"
 
         download_url = f"{base_url}/download/{output_filename}"
 
