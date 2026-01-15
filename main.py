@@ -166,11 +166,6 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 # =========================================================
 # Sign type + summary split (ROBUST)
 # =========================================================
-# Handles:
-#   "A1 - Room ID"
-#   "A1- Room ID"
-#   "A1 -Room ID"
-#   "E5.P&P, D/F - Double Sided 12 x 18 DOT, Post w/ Plate Mount"
 TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
 
 def looks_like_sign_code(code: str) -> bool:
@@ -193,13 +188,6 @@ def split_sign_type_and_summary(raw_sign_type: str) -> Tuple[str, str]:
     """
     Splits the FIRST dash separator into:
       (sign_type_code, summary_text)
-
-    Examples:
-      "A1 - Room ID" -> ("A1", "Room ID")
-      "A1- Room ID"  -> ("A1", "Room ID")
-      "A1 -Room ID"  -> ("A1", "Room ID")
-      "E5.P&P, D/F - Double Sided 12 x 18 DOT, Post w/ Plate Mount"
-        -> ("E5.P&P, D/F", "Double Sided 12 x 18 DOT, Post w/ Plate Mount")
     """
     if not raw_sign_type:
         return "", ""
@@ -290,8 +278,6 @@ def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
         dst.border = copy(src.border)
         dst.fill = copy(src.fill)
         dst.font = copy(src.font)
-        # Don't copy protection - we'll set it explicitly later
-        # dst.protection = copy(src.protection)
 
 
 # =========================================================
@@ -377,20 +363,12 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
 # Selection control: ONLY allow selecting body B–E
 # =========================================================
 def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
-    """
-    Excel decides selection/lock behavior for merged ranges based on the *top-left* cell.
-    So we must:
-      1) Unlock B–E in body rows
-      2) Unlock the top-left of any merged range that intersects B–E and the body rows
-      3) Keep F locked (and everything else locked)
-    """
     # 1) Unlock B–E directly
     for r in range(body_row_start, body_row_end + 1):
         for col in ("B", "C", "D", "E"):
             unlock_cell(ws, f"{col}{r}")
 
     # 2) Unlock top-left of merged ranges that intersect (rows body) and (cols B–E)
-    # B=2, E=5
     for rng in ws.merged_cells.ranges:
         min_row, max_row = rng.min_row, rng.max_row
         min_col, max_col = rng.min_col, rng.max_col
@@ -403,37 +381,25 @@ def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
 
 
 def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: int) -> None:
-    """
-    Locks everything, unlocks only B–E body cells, then enables sheet protection
-    so ONLY those unlocked cells are selectable.
-    """
     logging.info(f"Applying sheet protection for body rows {body_row_start} to {body_row_end}")
-    
-    # Lock everything in the used region
+
     max_row = max(ws.max_row, body_row_end + 5)
-    max_col = max(ws.max_column, 6)  # at least A–F
+    max_col = max(ws.max_column, 6)
     logging.info(f"Locking all cells up to row {max_row}, col {max_col}")
     lock_all_cells(ws, max_row=max_row, max_col=max_col)
 
-    # Unlock the allowed body selection area (and merged top-lefts)
     logging.info(f"Unlocking body cells B-E in rows {body_row_start}-{body_row_end}")
     unlock_body_selection(ws, body_row_start, body_row_end)
-    
-    # Verify a few cells are actually unlocked BEFORE enabling protection
+
     test_cells = [f"B{body_row_start}", f"C{body_row_start}", f"D{body_row_start}", f"E{body_row_start}", f"A{body_row_start}", f"F{body_row_start}"]
     for cell_ref in test_cells:
         locked = ws[cell_ref].protection.locked
         logging.info(f"BEFORE protection - Cell {cell_ref} locked status: {locked}")
 
-    # DON'T set selectLockedCells or selectUnlockedCells - preserve template settings
-    # Just re-enable sheet protection
     logging.info("Re-enabling sheet protection (preserving template EnableSelection setting)")
     ws.protection.sheet = True
-    
-    # Verify protection settings
+
     logging.info(f"Sheet protection enabled: {ws.protection.sheet}")
-    
-    # Verify cells are STILL unlocked after enabling protection
     for cell_ref in test_cells:
         locked = ws[cell_ref].protection.locked
         logging.info(f"AFTER protection - Cell {cell_ref} locked status: {locked}")
@@ -445,89 +411,73 @@ def fix_sheet_protection_xml(xlsx_path: str, sheet_name: str = "Proposal"):
     openpyxl doesn't save selectLockedCells/selectUnlockedCells correctly,
     so we manually edit the XML.
     """
-    # Create a temp directory to extract the xlsx
     temp_dir = tempfile.mkdtemp()
-    
+
     try:
-        # Extract the xlsx (it's just a zip file)
         with zipfile.ZipFile(xlsx_path, 'r') as zip_ref:
             zip_ref.extractall(temp_dir)
-        
-        # Find the sheet XML file (usually xl/worksheets/sheet1.xml)
-        # We need to find which sheet number corresponds to our sheet name
+
         workbook_xml = os.path.join(temp_dir, 'xl', 'workbook.xml')
         tree = ET.parse(workbook_xml)
         root = tree.getroot()
-        
-        # Find sheet ID for our sheet name
+
         ns = {'main': 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'}
         sheet_id = None
         for sheet in root.findall('.//main:sheet', ns):
             if sheet.get('name') == sheet_name:
-                # Get the rId and find corresponding sheet file
                 sheet_id = sheet.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
                 break
-        
+
         if not sheet_id:
             logging.warning(f"Could not find sheet '{sheet_name}' in workbook XML")
             return
-        
-        # Parse the rels file to find the actual sheet file
+
         rels_file = os.path.join(temp_dir, 'xl', '_rels', 'workbook.xml.rels')
         rels_tree = ET.parse(rels_file)
         rels_root = rels_tree.getroot()
-        
+
         sheet_file = None
         rels_ns = {'rel': 'http://schemas.openxmlformats.org/package/2006/relationships'}
         for rel in rels_root.findall('.//rel:Relationship', rels_ns):
             if rel.get('Id') == sheet_id:
                 sheet_file = rel.get('Target')
                 break
-        
+
         if not sheet_file:
             logging.warning(f"Could not find sheet file for sheet ID '{sheet_id}'")
             return
-        
-        # Now edit the sheet XML
+
         sheet_xml_path = os.path.join(temp_dir, 'xl', sheet_file)
         sheet_tree = ET.parse(sheet_xml_path)
         sheet_root = sheet_tree.getroot()
-        
-        # Find or create the sheetProtection element
+
         protection = sheet_root.find('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheetProtection')
-        
+
         if protection is not None:
-            # Remove selectLockedCells attribute if it exists
             if 'selectLockedCells' in protection.attrib:
                 del protection.attrib['selectLockedCells']
-            
-            # Set selectUnlockedCells to true
-            # According to Excel XML spec, omitting selectLockedCells means False
-            # Setting selectUnlockedCells to 1 means True
+
             protection.set('selectUnlockedCells', '1')
-            
+
             logging.info("Updated sheetProtection XML: removed selectLockedCells, set selectUnlockedCells=1")
-            
-            # Write back the modified XML
+
             sheet_tree.write(sheet_xml_path, encoding='utf-8', xml_declaration=True)
-            
-            # Re-zip everything back into the xlsx
+
             with zipfile.ZipFile(xlsx_path, 'w', zipfile.ZIP_DEFLATED) as zip_ref:
                 for root_dir, dirs, files in os.walk(temp_dir):
                     for file in files:
                         file_path = os.path.join(root_dir, file)
                         arc_name = os.path.relpath(file_path, temp_dir)
                         zip_ref.write(file_path, arc_name)
-            
+
             logging.info(f"Successfully fixed sheet protection XML in {xlsx_path}")
         else:
             logging.warning("No sheetProtection element found in XML")
-    
+
     except Exception as e:
         logging.error(f"Failed to fix sheet protection XML: {e}")
-    
+
     finally:
-        # Clean up temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -553,7 +503,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
-    # Delete old outputs (older than 30 minutes)
     cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
 
     try:
@@ -572,28 +521,22 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         if SHEET_NAME not in wb.sheetnames:
             raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
         ws = wb[SHEET_NAME]
-        
-        # DON'T replace the protection object - just disable it temporarily
-        # The template has the correct EnableSelection setting we want to preserve
+
         ws.protection.sheet = False
-        
         logging.info("Disabled template sheet protection (preserving settings)")
 
         insert_logo(ws)
 
-        # Capture template footer row heights BEFORE any insertion/deletion
         FOOTER_HEIGHT_START = 48
         FOOTER_HEIGHT_END = 120
         footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
 
-        # ---------------- Header mapping ----------------
         write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
         write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
         write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
         write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
         write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
 
-        # ---------------- Sold-to / Ship-to ----------------
         sold_to = estimate_data.get("sold_to", {}) or {}
         ship_to = estimate_data.get("ship_to", {}) or {}
 
@@ -617,7 +560,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         write_cell(ws, "C16", ship_csz)
         write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-        # ---------------- Dynamic body resize ----------------
         sign_types = estimate_data.get("sign_types", []) or []
         sign_count = len(sign_types)
 
@@ -636,7 +578,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         total_body_rows_needed = sign_count + EXTRA_BLANK
         body_last_row = BODY_START + total_body_rows_needed - 1
         body_change_count = footer_row_offset - 5
-        # Add body change indicator in H3
+
         if body_change_count > 0:
             change_text = f"Add {body_change_count}"
         elif body_change_count < 0:
@@ -646,12 +588,10 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         ws["H3"].value = change_text
         logging.info(f"Body row change: {change_text}")
 
-        # ---------------- Write sign lines ----------------
         COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
         current_row = BODY_START
         item_num = 1
 
-        # Track duplicates by sign code
         sign_code_counts: Dict[str, int] = {}
 
         for sign in sign_types:
@@ -673,7 +613,6 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_QTY}{current_row}"].value = qty_val
                 ws[f"{COL_DESC}{current_row}"].value = desc_summary
                 ws[f"{COL_UNIT}{current_row}"].value = unit_val
-                # Total = Qty * Unit Price (formula)
                 if qty_val is not None and unit_val is not None:
                     ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
                 else:
@@ -684,13 +623,11 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
                 ws[f"{COL_DESC}{current_row}"].value = f"ALTERNATE {desc_summary}"
                 unit_val = round_nearest_dollar(sign.get("unit_price"))
                 ws[f"{COL_UNIT}{current_row}"].value = unit_val
-                # No total for alternates
                 ws[f"{COL_TOTAL}{current_row}"].value = None
 
             current_row += 1
             item_num += 1
 
-        # ---------------- Totals (hard-coded cells shifted) ----------------
         totals = estimate_data.get("totals", {}) or {}
         grand_total = safe_num(totals.get("total"))
         shipping_total = sum_extended(estimate_data.get("shipping"))
@@ -701,24 +638,19 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         INSTALL_CELL = "F53"
         TOTAL_CELL = "F54"
 
-        # Subtotal: Use SUM formula for all body rows in column F
         subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
         body_sum_range = f"F{BODY_START}:F{body_last_row}"
         ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
-        
-        # Shipping: default to 0.00 if None or zero
+
         shipping_value = shipping_total if shipping_total else 0.00
         write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_value)
-        
-        # Installation: default to 0.00 if None or zero
+
         install_value = install_total if install_total else 0.00
         write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_value)
-        
-        # Grand total
+
         if grand_total is not None:
             write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
-        # ---------------- Row height adjustment below row 26 ----------------
         last_used_row = ws.max_row
         approximate_autofit_rows(
             ws,
@@ -728,21 +660,19 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
             min_height=15.0
         )
 
-        # Restore footer row heights to template values (shifted)
         restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
-        # ---------------- Selection rules (ONLY allow selecting B–E in body) ----------------
-        # CRITICAL: Must be the VERY LAST thing before saving - don't touch any cells after this!
         apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
-        
+
         logging.info("About to save workbook - no more cell modifications after this point")
 
-        # ---------------- Save output workbook ----------------
         file_id = uuid.uuid4().hex
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
         wb.save(out_path)
 
+    except HTTPException:
+        raise
     except Exception as e:
         logging.exception("Proposal generation failed")
         raise HTTPException(status_code=500, detail=str(e))
@@ -767,10 +697,10 @@ def download_file(filename: str):
         filename=filename
     )
 
+
 # =============================================================================
 # WEB INTERFACE AND PDF PARSING - Added for direct PDF upload
 # =============================================================================
-
 from pydantic import BaseModel
 from pypdf import PdfReader
 import base64
@@ -782,12 +712,11 @@ class GenerateFromPdfRequest(BaseModel):
     filename: str = "estimate.pdf"
 
 
-# Web Interface Route
 @app.get("/", response_class=HTMLResponse)
 async def web_interface():
     """Serve the HTML upload interface"""
     html_path = Path(__file__).parent / "templates" / "upload.html"
-    
+
     if not html_path.exists():
         return """
         <html>
@@ -798,12 +727,10 @@ async def web_interface():
         </body>
         </html>
         """
-    
+
     with open(html_path) as f:
         return f.read()
 
-
-# PDF Parsing Function
 
 def generate_excel_from_data(estimate_data: dict, output_path: str):
     """
@@ -817,7 +744,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     if SHEET_NAME not in wb.sheetnames:
         raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
     ws = wb[SHEET_NAME]
-    
+
     ws.protection.sheet = False
     logging.info("Disabled template sheet protection (preserving settings)")
 
@@ -877,7 +804,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     total_body_rows_needed = sign_count + EXTRA_BLANK
     body_last_row = BODY_START + total_body_rows_needed - 1
     body_change_count = footer_row_offset - 5
-    
+
     if body_change_count > 0:
         change_text = f"Add {body_change_count}"
     elif body_change_count < 0:
@@ -942,13 +869,13 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
     body_sum_range = f"F{BODY_START}:F{body_last_row}"
     ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
-    
+
     shipping_value = shipping_total if shipping_total else 0.00
     write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_value)
-    
+
     install_value = install_total if install_total else 0.00
     write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_value)
-    
+
     if grand_total is not None:
         write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
@@ -966,17 +893,112 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
     # Selection rules
     apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
-    
+
     logging.info("About to save workbook")
 
-    # Save
     wb.save(output_path)
 
 
+# =============================================================================
+# PDF parsing (with section parser + fallback global scanner)
+# =============================================================================
+
+# More forgiving line-item regexes
+LINE_ITEM_RE_STRICT_COLUMNS = re.compile(
+    r'^\s*(.+?)\s{2,}(\d+(?:\.\d+)?)\s{2,}\$?\s*([\d,]+(?:\.\d{2})?)\s{2,}\$?\s*([\d,]+(?:\.\d{2})?)\s*$'
+)
+LINE_ITEM_RE_LOOSE = re.compile(
+    r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d{2})?)\s+\$?\s*([\d,]+(?:\.\d{2})?)\s*$'
+)
+
+EXCLUDE_DESC_TOKENS = (
+    "installation",
+    "install",
+    "packing",
+    "shipping",
+    "freight",
+    "mobilization",
+    "permit",
+    "permitting",
+    "tax",
+)
+
+def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to parse a single PDF-extracted text line into:
+      description, qty, unit_price, extended
+    Returns None if not parseable.
+    """
+    if not line or not line.strip():
+        return None
+
+    m = LINE_ITEM_RE_STRICT_COLUMNS.match(line)
+    if not m:
+        m = LINE_ITEM_RE_LOOSE.match(line)
+    if not m:
+        return None
+
+    description = m.group(1).strip()
+    qty_raw = m.group(2).strip()
+    unit_raw = m.group(3).strip().replace(",", "")
+    ext_raw = m.group(4).strip().replace(",", "")
+
+    try:
+        qty = float(qty_raw)
+        # many times qty is an integer, but keep float safe
+        if abs(qty - int(qty)) < 1e-9:
+            qty = int(qty)
+        unit_price = float(unit_raw)
+        extended = float(ext_raw)
+    except Exception:
+        return None
+
+    # Filter out non-sign items by keyword
+    lower_desc = description.lower()
+    if any(tok in lower_desc for tok in EXCLUDE_DESC_TOKENS):
+        return None
+
+    # Optional sanity: extended should be close-ish to qty*unit (some PDFs include rounding/markup)
+    # If it's wildly off, skip.
+    try:
+        expected = float(qty) * float(unit_price)
+        if expected > 0 and abs(extended - expected) / expected > 0.50:
+            # more than 50% off is suspicious; ignore
+            return None
+    except Exception:
+        pass
+
+    clean_type, summary = split_sign_type_and_summary(description)
+
+    return {
+        "sign_type": clean_type or description,
+        "description": summary or description,
+        "qty": qty,
+        "unit_price": unit_price,
+        "extended": extended,
+    }
+
+def _dedupe_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    out = []
+    for it in items:
+        key = (
+            safe_str(it.get("sign_type")).strip(),
+            safe_str(it.get("description")).strip(),
+            str(it.get("qty")),
+            f"{safe_num(it.get('unit_price')) or 0:.4f}",
+            f"{safe_num(it.get('extended')) or 0:.4f}",
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
 def parse_boyd_estimate_from_text(text: str) -> dict:
     """Parse Boyd estimate PDF text into structured JSON data."""
-    lines = [line for line in text.split('\n')]
-    
+    lines = [line for line in (text or "").split("\n")]
+
     data = {
         "estimate_date": "",
         "project_id": "",
@@ -991,98 +1013,112 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
         "installation": [],
         "totals": {"sub_total": 0.0, "mark_up": 0.0, "total": 0.0}
     }
-    
-    # Extract header information
+
+    # Extract header-ish info (best-effort)
     for line in lines:
         if 'Date' in line and not data['estimate_date']:
             match = re.search(r'Date\s+(\d{1,2}/\d{1,2}/\d{2,4})', line)
             if match:
                 data['estimate_date'] = match.group(1)
-        
+
         if 'Project Id' in line:
             match = re.search(r'Project Id\s*:\s*(\S+)', line)
             if match:
                 data['project_id'] = match.group(1)
-        
+
         if 'Project Desc' in line:
             match = re.search(r'Project Desc\.?\s*:\s*(.+?)(?:Ship Via|$)', line)
             if match:
                 data['project_description'] = match.group(1).strip()
-        
-        if 'Salesperson' in line and ':' in line:
-            match = re.search(r'Salesperson\s*:\s*(.+?)(?:\s|$)', line)
+
+        if 'Salesperson' in line and ':' in line and not data["salesperson"]:
+            match = re.search(r'Salesperson\s*:\s*(.+?)(?:\s{2,}|$)', line)
             if match:
                 data['salesperson'] = match.group(1).strip()
-        
-        if 'Project Manager:' in line:
+
+        if 'Project Manager:' in line and not data["project_manager"]:
             match = re.search(r'Project Manager:\s*(.+?)(?:Project|$)', line)
             if match:
                 data['project_manager'] = match.group(1).strip()
-        
-        if 'Project Engineer:' in line:
+
+        if 'Project Engineer:' in line and not data["project_engineer"]:
             match = re.search(r'Project Engineer:\s*(.+?)(?:REQUESTED|$)', line)
             if match:
                 data['project_engineer'] = match.group(1).strip()
-    
-    # Extract line items
+
+    # --------------------------
+    # 1) Primary: parse items inside "SIGNAGE PACKAGE" section
+    # --------------------------
     in_signage_package = False
-    
+    section_items: List[Dict[str, Any]] = []
+
     for line in lines:
-        if 'SIGNAGE SAMPLES PACKAGE' in line:
+        # stop early at totals section
+        if re.search(r'\bSUB[- ]?TOTAL\b', line, re.I):
+            break
+
+        # section toggles (case-insensitive)
+        if re.search(r'\bSIGNAGE\s+SAMPLES\s+PACKAGE\b', line, re.I):
             in_signage_package = False
             continue
-        
-        if 'SIGNAGE PACKAGE' in line and 'SAMPLES' not in line:
+
+        if re.search(r'\bSIGNAGE\s+PACKAGE\b', line, re.I) and not re.search(r'\bSAMPLES\b', line, re.I):
             in_signage_package = True
             continue
-        
-        if 'SUB-TOTAL' in line:
-            break
-        
+
         if in_signage_package:
-            match = re.match(r'^\s+(.+?)\s+(\d+)\s*\$\s*([\d,]+\.?\d*)\s*\$?\s*([\d,]+\.?\d*)$', line)
-            
-            if match:
-                description = match.group(1).strip()
-                try:
-                    qty = int(match.group(2))
-                    unit_price = float(match.group(3).replace(',', ''))
-                    extended = float(match.group(4).replace(',', ''))
-                except ValueError:
-                    continue
-                
-                lower_desc = description.lower()
-                if ('installation' not in lower_desc and 
-                    'packing' not in lower_desc and 
-                    'shipping' not in lower_desc and
-                    'mobilization' not in lower_desc and
-                    'permitting' not in lower_desc):
-                    
-                    data['sign_types'].append({
-                        'description': description,
-                        'qty': qty,
-                        'unit_price': unit_price,
-                        'extended': extended
-                    })
-    
-    # Extract totals
+            parsed = _parse_line_item(line)
+            if parsed:
+                section_items.append(parsed)
+
+    section_items = _dedupe_items(section_items)
+
+    # --------------------------
+    # 2) Fallback: scan entire document for line items
+    # --------------------------
+    fallback_items: List[Dict[str, Any]] = []
+    if not section_items:
+        logging.info("No items found in SIGNAGE PACKAGE section; running fallback global scan.")
+        for line in lines:
+            # skip obvious headers and totals-ish lines
+            if re.search(r'\bSUB[- ]?TOTAL\b|\bMARK[- ]?UP\b|\bTOTAL\b', line, re.I):
+                continue
+            if re.search(r'\bSIGNAGE\b\s+\bPACKAGE\b', line, re.I):
+                continue
+
+            parsed = _parse_line_item(line)
+            if parsed:
+                fallback_items.append(parsed)
+
+        fallback_items = _dedupe_items(fallback_items)
+
+    items = section_items if section_items else fallback_items
+    data["sign_types"] = items
+
+    # Extract totals (best-effort)
     for i, line in enumerate(lines):
-        if 'SUB-TOTAL' in line:
-            match = re.search(r'\$\s*([\d,]+\.?\d*)', line)
-            if match:
-                data['totals']['sub_total'] = float(match.group(1).replace(',', ''))
-        
-        if 'MARK-UP' in line:
-            match = re.search(r'\$\s*([\d,]+\.?\d*)', line)
-            if match:
-                data['totals']['mark_up'] = float(match.group(1).replace(',', ''))
-        
-        if line.strip() == 'TOTAL' and i > 0:
-            prev_line = lines[i-1]
-            match = re.search(r'\$\s*([\d,]+\.?\d*)', prev_line)
-            if match:
-                data['totals']['total'] = float(match.group(1).replace(',', ''))
-    
+        if re.search(r'\bSUB[- ]?TOTAL\b', line, re.I):
+            m = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', line)
+            if m:
+                data['totals']['sub_total'] = float(m.group(1).replace(',', ''))
+
+        if re.search(r'\bMARK[- ]?UP\b', line, re.I):
+            m = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', line)
+            if m:
+                data['totals']['mark_up'] = float(m.group(1).replace(',', ''))
+
+        # TOTAL sometimes appears on same line with a dollar amount
+        if re.search(r'^\s*TOTAL\b', line, re.I):
+            m = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', line)
+            if m:
+                data['totals']['total'] = float(m.group(1).replace(',', ''))
+            else:
+                # sometimes amount is on previous line
+                if i > 0:
+                    pm = re.search(r'\$\s*([\d,]+(?:\.\d{2})?)', lines[i-1])
+                    if pm:
+                        data['totals']['total'] = float(pm.group(1).replace(',', ''))
+
     return data
 
 
@@ -1092,47 +1128,44 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
     """Upload PDF, extract text, parse data, generate Excel."""
     try:
         logging.info(f"Processing PDF: {request.filename}")
-        
-        # Decode and extract PDF text
+
         pdf_bytes = base64.b64decode(request.pdf_base64)
         pdf_file = BytesIO(pdf_bytes)
         reader = PdfReader(pdf_file)
-        
-        text = ""
+
+        text_parts = []
         for page in reader.pages:
-            text += page.extract_text() + "\n"
-        
+            page_text = page.extract_text() or ""
+            text_parts.append(page_text)
+        text = "\n".join(text_parts) + "\n"
+
         logging.info(f"Extracted {len(text)} characters from {len(reader.pages)} pages")
-        
-        # Parse estimate data
+
         estimate_data = parse_boyd_estimate_from_text(text)
-        
+
         items_count = len(estimate_data.get('sign_types', []))
         logging.info(f"Parsed {items_count} line items")
-        
+
         if items_count == 0:
             raise HTTPException(
                 status_code=400,
                 detail="No line items found in PDF. Please check the PDF format."
             )
-        
-        # Generate Excel using existing function
+
         cleanup_old_generated_workbooks(OUTPUT_DIR)
-        
+
         unique_id = uuid.uuid4().hex
         output_filename = f"Boyd_Proposal_{unique_id}.xlsx"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
-        
-        # Call existing generate_proposal_internal function
+
         generate_excel_from_data(estimate_data, output_path)
-        
-        # Return download URL
+
         base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
         if not base_url:
             base_url = "http://localhost:8000"
-        
+
         download_url = f"{base_url}/download/{output_filename}"
-        
+
         return {
             "status": "success",
             "filename": output_filename,
@@ -1141,7 +1174,10 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
             "project_id": estimate_data.get('project_id', 'N/A'),
             "total": estimate_data.get('totals', {}).get('total', 0)
         }
-        
+
+    except HTTPException:
+        # ✅ Preserve deliberate 4xx errors (like "no line items")
+        raise
     except Exception as e:
         logging.error(f"Error processing PDF: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
