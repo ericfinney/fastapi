@@ -13,8 +13,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, Body, HTTPException
-from fastapi.responses import HTMLResponse
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Protection
@@ -32,8 +31,7 @@ SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
 
-# If a PDF is huge, we switch to streaming parsing (page-by-page) automatically.
-# You can tune these:
+# Fallback mode for big PDFs:
 MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
@@ -43,7 +41,7 @@ app = FastAPI()
 
 
 # =========================================================
-# Cleanup: delete old generated workbooks (older than N minutes)
+# Cleanup: delete old generated workbooks
 # =========================================================
 def cleanup_old_generated_workbooks(
     directory: str,
@@ -143,8 +141,8 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 
 
 # =========================================================
-# Sign type + summary split (for Excel display only)
-# JSON retains sign_type EXACTLY as in PDF.
+# Sign type + summary split (Excel display only)
+# JSON keeps sign_type EXACTLY as PDF.
 # =========================================================
 TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
 
@@ -161,11 +159,6 @@ def looks_like_sign_code(code: str) -> bool:
     return True
 
 def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
-    """
-    For Excel layout only:
-      If "CODE - Summary" -> ("CODE", "Summary")
-      Otherwise -> ("", raw)
-    """
     if not raw:
         return "", ""
     s = str(raw).strip()
@@ -183,7 +176,7 @@ def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
 
 
 # =========================================================
-# Merge shifting helpers (used by adjust body)
+# Merge shifting helpers
 # =========================================================
 CELL_RE = re.compile(r"^([A-Z]+)(\d+)$")
 
@@ -258,7 +251,7 @@ def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
 
 
 # =========================================================
-# Body adjust with merge + style preservation
+# Body adjust
 # =========================================================
 def adjust_body_rows_preserve_footer(
     ws,
@@ -281,14 +274,12 @@ def adjust_body_rows_preserve_footer(
     max_col = ws.max_column
 
     if diff > 0:
-        logging.info("Inserting %d row(s) at %d to expand body.", diff, footer_start)
         ws.insert_rows(footer_start, amount=diff)
         for r in range(footer_start, footer_start + diff):
             copy_row_style(ws, src_row=body_end, dst_row=r, max_col=max_col)
     else:
         delete_count = abs(diff)
         delete_start = body_start + needed_rows
-        logging.info("Deleting %d row(s) at %d to shrink body.", delete_count, delete_start)
         ws.delete_rows(delete_start, amount=delete_count)
 
     restore_merges(ws, merges, footer_start, diff)
@@ -312,7 +303,7 @@ def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
 
 
 # =========================================================
-# Approximate Row Height "AutoFit"
+# Approx row height
 # =========================================================
 def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[str], min_height: float = 15.0):
     CHARS_PER_LINE = 60
@@ -337,7 +328,7 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
 
 
 # =========================================================
-# Selection control: ONLY allow selecting body B–E
+# Selection control
 # =========================================================
 def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
     for r in range(body_row_start, body_row_end + 1):
@@ -353,7 +344,6 @@ def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
 
         if rows_intersect and cols_intersect:
             ws.cell(row=min_row, column=min_col).protection = Protection(locked=False)
-
 
 def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: int) -> None:
     max_row = max(ws.max_row, body_row_end + 5)
@@ -380,11 +370,6 @@ def health_check():
 
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
-    """
-    Action endpoint: expects {"payload": "<JSON string>"} exactly.
-    """
-    logging.info("Incoming request: payload keys = %s", list(payload.keys()) if payload else None)
-
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
@@ -436,7 +421,7 @@ def download_file(filename: str):
 
 
 # =============================================================================
-# WEB INTERFACE AND PDF PARSING
+# Web interface & request model
 # =============================================================================
 class GenerateFromPdfRequest(BaseModel):
     pdf_base64: str
@@ -447,18 +432,13 @@ class GenerateFromPdfRequest(BaseModel):
 async def web_interface():
     html_path = Path(__file__).parent / "templates" / "upload.html"
     if not html_path.exists():
-        return """
-        <html><body>
-        <h1>Boyd Proposal Generator</h1>
-        <p>Use POST /generate_proposal_from_pdf</p>
-        </body></html>
-        """
+        return """<html><body><h1>Boyd Proposal Generator</h1><p>Use POST /generate_proposal_from_pdf</p></body></html>"""
     with open(html_path) as f:
         return f.read()
 
 
 # =============================================================================
-# Excel generation (updated to align with JSON schema in your instructions)
+# Excel generation aligned with JSON schema
 # =============================================================================
 def generate_excel_from_data(estimate_data: dict, output_path: str):
     if not os.path.exists(TEMPLATE_PATH):
@@ -476,14 +456,12 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     FOOTER_HEIGHT_END = 120
     footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
 
-    # Header fields (leave empty if missing)
     write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
     write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
     write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
     write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
     write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
 
-    # Sold-to / Ship-to
     sold_to = estimate_data.get("sold_to", {}) or {}
     ship_to = estimate_data.get("ship_to", {}) or {}
 
@@ -507,7 +485,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     write_cell(ws, "C16", ship_csz)
     write_cell(ws, "C17", safe_str(ship_to.get("phone")))
 
-    # Main sign table
     sign_types = estimate_data.get("sign_types", []) or []
     sign_count = len(sign_types)
 
@@ -535,7 +512,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         qty_val = safe_num(sign.get("qty"))
         unit_val = safe_num(sign.get("unit_price"))
 
-        # Excel formatting: try to split CODE - Summary for display only.
         code, summary = split_sign_type_and_summary(raw_line)
 
         ws[f"{COL_ITEM}{current_row}"].value = item_num
@@ -546,11 +522,9 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
             ws[f"{COL_DESC}{current_row}"].value = summary
         else:
-            # If we can't confidently split, keep EXACT line in description to preserve "as listed".
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
             ws[f"{COL_DESC}{current_row}"].value = raw_line
 
-        # Let Excel compute line total from qty*unit, but totals section is trusted from PDF separately.
         if qty_val is not None and unit_val is not None:
             ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
         else:
@@ -559,7 +533,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         current_row += 1
         item_num += 1
 
-    # Totals section: trust PDF totals if present
     totals = estimate_data.get("totals", {}) or {}
     grand_total = safe_num(totals.get("total"))
 
@@ -575,14 +548,12 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     body_sum_range = f"F{BODY_START}:F{body_last_row}"
     ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
 
-    # Dedicated sections: push totals into dedicated cells
     write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_total if shipping_total is not None else 0.00)
     write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_total if install_total is not None else 0.00)
 
     if grand_total is not None:
         write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
-    # Row height adjustment
     last_used_row = ws.max_row
     approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
     restore_row_heights(ws, footer_row_heights, footer_row_offset)
@@ -593,29 +564,27 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
 
 # =============================================================================
-# PDF parsing matching your GPT instructions
+# PDF parsing updated for THIS estimate format
 # =============================================================================
 
-# Common Boyd estimate line-item structure: description  qty  unit  extended
+# Accept: description qty $ unit $ extended
+# - spacing can be 1+ spaces
+# - unit/extended decimals can be any length (114.1538)
+# - commas supported
 LINE_ITEM_RE = re.compile(
-    r'^\s*(.+?)\s{2,}(\d+(?:\.\d+)?)\s{2,}\$?\s*([\d,]+(?:\.\d{2})?)\s{2,}\$?\s*([\d,]+(?:\.\d{2})?)\s*$'
+    r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*$'
 )
 
-MONEY_RE = re.compile(r'\$?\s*([\d,]+(?:\.\d{2})?)')
+MONEY_RE = re.compile(r'\$?\s*([\d,]+(?:\.\d+)?)')
 
-# Section detectors (case-insensitive, tolerant)
-SECTION_SIGNAGE_RE = re.compile(r'\bSIGNAGE\s+PACKAGE\b', re.I)
-SECTION_SIGNAGE_SAMPLES_RE = re.compile(r'\bSIGNAGE\s+SAMPLES\s+PACKAGE\b', re.I)
-
-SECTION_SHIPPING_RE = re.compile(r'\bSHIPPING\b', re.I)
-SECTION_INSTALL_RE = re.compile(r'\bINSTALL(?:ATION)?\b', re.I)
-
-# Totals lines
 SUBTOTAL_RE = re.compile(r'\bSUB[- ]?TOTAL\b', re.I)
 MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
 TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
-# Header-ish fields
+# IMPORTANT: Your estimate uses "SIGN PACKAGE" (not "SIGNAGE PACKAGE")
+SIGNAGE_LIKE_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b', re.I)   # matches SIGN PACKAGE or SIGNAGE PACKAGE
+SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s+Type\s*&\s+Overall\b', re.I)
+
 DATE_RE = re.compile(r'\bDate\s+(\d{1,2}/\d{1,2}/\d{2,4})\b', re.I)
 PROJECT_ID_RE = re.compile(r'\bProject\s+Id\s*:\s*(\S+)\b', re.I)
 PROJECT_DESC_RE = re.compile(r'\bProject\s+Desc\.?\s*:\s*(.+?)\s*(?:Ship\s+Via|$)', re.I)
@@ -623,35 +592,20 @@ SALESPERSON_RE = re.compile(r'\bSalesperson\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
 PM_RE = re.compile(r'\bProject\s+Manager\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
 PE_RE = re.compile(r'\bProject\s+Engineer\s*:\s*(.+?)(?:\s{2,}|$)', re.I)
 
-def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
-    """
-    Strictly extract from the PDF line.
-    Do not reject based on heuristics. Do not “fix” values.
-    Missing/unparseable -> None.
-    """
-    if not line or not line.strip():
-        return None
-    m = LINE_ITEM_RE.match(line)
-    if not m:
-        return None
-
-    description = m.group(1).strip()
-    qty_raw = m.group(2).strip()
-    unit_raw = m.group(3).strip().replace(",", "")
-    ext_raw = m.group(4).strip().replace(",", "")
-
-    qty = safe_num(qty_raw)
-    if qty is not None and abs(qty - int(qty)) < 1e-9:
-        qty = int(qty)
-
-    unit_price = safe_num(unit_raw)
-    extended_total = safe_num(ext_raw)
-
+def _init_data() -> Dict[str, Any]:
     return {
-        "description": description,
-        "qty": qty,
-        "unit_price": unit_price,
-        "extended_total": extended_total,
+        "estimate_date": "",
+        "project_id": "",
+        "project_description": "",
+        "salesperson": "",
+        "project_manager": "",
+        "project_engineer": "",
+        "sold_to": {"name": "", "address_lines": [], "city": "", "state": "", "zip": "", "phone": ""},
+        "ship_to": {"name": "", "address_lines": [], "city": "", "state": "", "zip": "", "phone": ""},
+        "sign_types": [],
+        "shipping": [],
+        "installation": [],
+        "totals": {"sub_total": None, "mark_up": None, "total": None}
     }
 
 def _extract_money(line: str) -> Optional[float]:
@@ -662,43 +616,6 @@ def _extract_money(line: str) -> Optional[float]:
         return float(m.group(1).replace(",", ""))
     except Exception:
         return None
-
-def _init_data() -> Dict[str, Any]:
-    """
-    Per your instructions: missing values are "" or null.
-    """
-    return {
-        "estimate_date": "",
-        "project_id": "",
-        "project_description": "",
-        "salesperson": "",
-        "project_manager": "",
-        "project_engineer": "",
-        "sold_to": {
-            "name": "",
-            "address_lines": [],
-            "city": "",
-            "state": "",
-            "zip": "",
-            "phone": ""
-        },
-        "ship_to": {
-            "name": "",
-            "address_lines": [],
-            "city": "",
-            "state": "",
-            "zip": "",
-            "phone": ""
-        },
-        "sign_types": [],       # (sign_type, qty, unit_price, extended_total)
-        "shipping": [],         # (description, qty, unit_price, extended_total, notes)
-        "installation": [],     # (description, qty, unit_price, extended_total, notes)
-        "totals": {
-            "sub_total": None,
-            "mark_up": None,
-            "total": None
-        }
-    }
 
 def _apply_header_extraction(data: Dict[str, Any], line: str):
     if not data["estimate_date"]:
@@ -738,67 +655,84 @@ def _apply_totals_extraction(data: Dict[str, Any], line: str):
     if data["totals"]["mark_up"] is None and MARKUP_RE.search(line):
         data["totals"]["mark_up"] = _extract_money(line)
 
-    # TOTAL can appear multiple times; prefer the first parsable "TOTAL" line
     if data["totals"]["total"] is None and TOTAL_RE.search(line):
         data["totals"]["total"] = _extract_money(line)
 
+def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Only parse summary rows with prices.
+    Require a '$' to avoid parsing dimension/component lines like:
+      "Backer Panel 6.00 6.00 .125 1"
+    """
+    if not line or not line.strip():
+        return None
+    if "$" not in line:
+        return None
+
+    m = LINE_ITEM_RE.match(line)
+    if not m:
+        return None
+
+    description = m.group(1).strip()
+    qty_raw = m.group(2).strip()
+    unit_raw = m.group(3).strip().replace(",", "")
+    ext_raw = m.group(4).strip().replace(",", "")
+
+    qty = safe_num(qty_raw)
+    if qty is not None and abs(qty - int(qty)) < 1e-9:
+        qty = int(qty)
+    unit_price = safe_num(unit_raw)
+    extended_total = safe_num(ext_raw)
+
+    return {
+        "description": description,
+        "qty": qty,
+        "unit_price": unit_price,
+        "extended_total": extended_total,
+    }
+
 def _section_from_line(current: str, line: str) -> str:
-    """
-    Determine active section based on headings.
-    We avoid keyword heuristics on individual items and instead rely on headings.
-    """
-    # Explicit signage samples end signage parsing
-    if SECTION_SIGNAGE_SAMPLES_RE.search(line):
-        return "other"
+    # If we hit totals, stop parsing sections
+    if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
+        return "totals"
 
-    # Signage package
-    if SECTION_SIGNAGE_RE.search(line) and not re.search(r'\bSAMPLES\b', line, re.I):
-        return "signage"
-
-    # Shipping section heading
-    # (Some estimates label it as SHIPPING PACKAGE or lines with SHIPPING + columns)
+    # Shipping / Installation headings (keep your originals)
     if re.search(r'\bSHIPPING\s+PACKAGE\b', line, re.I) or re.search(r'^\s*SHIPPING\b', line, re.I):
         return "shipping"
-
-    # Installation section heading
     if re.search(r'\bINSTALL(?:ATION)?\s+PACKAGE\b', line, re.I) or re.search(r'^\s*INSTALL(?:ATION)?\b', line, re.I):
         return "installation"
 
-    # If we hit totals, stop sections
-    if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
-        return "totals"
+    # Signage/sign package headings:
+    # Your pages have "SIGN PACKAGE" and also repeat the table header on each page.
+    if SIGNAGE_LIKE_RE.search(line):
+        return "signage"
+    if SIGN_TABLE_HEADER_RE.search(line):
+        # Treat the start of the table as signage section unless we're explicitly in shipping/install
+        if current not in ("shipping", "installation"):
+            return "signage"
 
     return current
 
 def parse_boyd_estimate_from_text(text: str) -> dict:
-    """
-    Full parse (non-streaming): best when PDF is moderate sized.
-    """
     data = _init_data()
+    section = "other"
     lines = [line for line in (text or "").split("\n")]
 
-    section = "other"
     for raw in lines:
         line = raw.strip("\r")
 
-        # header fields best-effort
         _apply_header_extraction(data, line)
-
-        # totals best-effort
         _apply_totals_extraction(data, line)
 
-        # section transitions
         section = _section_from_line(section, line)
 
-        # parse line items in known sections
         parsed = _parse_line_item(line)
         if not parsed:
             continue
 
         if section == "signage":
-            # IMPORTANT: include sign type exactly as listed.
             data["sign_types"].append({
-                "sign_type": parsed["description"],
+                "sign_type": parsed["description"],   # exact as listed
                 "qty": parsed["qty"],
                 "unit_price": parsed["unit_price"],
                 "extended_total": parsed["extended_total"],
@@ -819,20 +753,10 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
                 "extended_total": parsed["extended_total"],
                 "notes": ""
             })
-        else:
-            # Outside known sections, do nothing.
-            # This prevents the fallback from mis-bucketing shipping/install into sign types.
-            pass
 
     return data
 
 def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
-    """
-    Fallback mode for very large PDFs:
-      - processes page-by-page
-      - does NOT concatenate all text
-      - still respects sections
-    """
     data = _init_data()
     section = "other"
 
@@ -878,14 +802,10 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
 
 
 # =============================================================================
-# PDF Upload and Processing Endpoint
+# PDF upload endpoint
 # =============================================================================
 @app.post("/generate_proposal_from_pdf")
 async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
-    """
-    Upload PDF, extract text, parse data, generate Excel.
-    Includes fallback streaming parsing for large PDFs.
-    """
     try:
         logging.info("Processing PDF: %s", request.filename)
 
@@ -896,18 +816,13 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
         num_pages = len(reader.pages)
         logging.info("PDF pages: %d", num_pages)
 
-        # Decide parsing mode:
-        # - If many pages, use streaming fallback.
-        # - Else try full extraction; if extracted text is too large, switch to streaming.
         use_streaming = num_pages >= MAX_PDF_PAGES_STREAMING
-
         estimate_data = None
 
         if use_streaming:
             logging.info("Using streaming parser (page-by-page) due to page count.")
             estimate_data = parse_boyd_estimate_streaming(reader)
         else:
-            # full extraction
             text_parts = []
             total_chars = 0
             for page in reader.pages:
@@ -925,13 +840,11 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
 
         items_count = len(estimate_data.get("sign_types", []))
         logging.info("Parsed sign line items: %d", items_count)
-        logging.info("Parsed shipping items: %d", len(estimate_data.get("shipping", [])))
-        logging.info("Parsed installation items: %d", len(estimate_data.get("installation", [])))
 
         if items_count == 0:
             raise HTTPException(
                 status_code=400,
-                detail="No sign line items found in PDF (SIGNAGE PACKAGE section not detected or no parseable rows)."
+                detail="No sign line items found in PDF (could not detect sign section or parse price rows)."
             )
 
         cleanup_old_generated_workbooks(OUTPUT_DIR)
@@ -944,7 +857,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
 
         base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
         if not base_url:
-            base_url = "http://fastapi-testing-c2c5.up.railway.app"
+            base_url = "https://fastapi-testing-c2c5.up.railway.app/"
 
         download_url = f"{base_url}/download/{output_filename}"
 
@@ -955,7 +868,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
             "items_count": items_count,
             "project_id": estimate_data.get("project_id", ""),
             "total": estimate_data.get("totals", {}).get("total", None),
-            "used_streaming_fallback": use_streaming or False
+            "used_streaming_fallback": bool(use_streaming)
         }
 
     except HTTPException:
