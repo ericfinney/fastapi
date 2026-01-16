@@ -507,6 +507,8 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     current_row = BODY_START
     item_num = 1
 
+    prev_primary_code = None  # track previous "normal" sign code for alternates
+    
     for sign in sign_types:
         raw_line = safe_str(sign.get("sign_type"))
         qty_val = safe_num(sign.get("qty"))
@@ -514,21 +516,54 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
         code, summary = split_sign_type_and_summary(raw_line)
 
+        # Identify special rows (headers/subtotals/spacers) — these should not affect alternate tracking
+        is_special_row = (qty_val is None and unit_val is None and (raw_line.strip() == "" or is_bold_description_row(raw_line) or code == ""))
+
+        # Detect alternate: two consecutive priced rows with SAME sign code
+        is_priced_row = (qty_val is not None and unit_val is not None)
+        is_alternate = False
+        if is_priced_row and code and prev_primary_code == code:
+            is_alternate = True
+
+        # Always write item # (you can change this if you want alternates unnumbered)
         ws[f"{COL_ITEM}{current_row}"].value = item_num
-        ws[f"{COL_QTY}{current_row}"].value = qty_val
-        ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
 
-        if code:
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
-            ws[f"{COL_DESC}{current_row}"].value = summary
-        else:
+        if is_alternate:
+            # Alternate row rules:
+            # - no sign type, no qty, no total
+            # - description prefixed with "Alternate "
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-            ws[f"{COL_DESC}{current_row}"].value = raw_line
-
-        if qty_val is not None and unit_val is not None:
-            ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
-        else:
+            ws[f"{COL_QTY}{current_row}"].value = None
             ws[f"{COL_TOTAL}{current_row}"].value = None
+
+            # Put full description in C (prefer summary if we have it)
+            alt_desc = summary if summary else (raw_line or "")
+            ws[f"{COL_DESC}{current_row}"].value = f"Alternate {alt_desc}".strip()
+
+            # Keep unit price
+            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
+
+            # Alternates should NOT reset prev_primary_code (we keep it)
+        else:
+            # Normal behavior (including headers/subtotals/spacers)
+            ws[f"{COL_QTY}{current_row}"].value = qty_val
+            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
+
+            if code:
+                ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
+                ws[f"{COL_DESC}{current_row}"].value = summary
+            else:
+                ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
+                ws[f"{COL_DESC}{current_row}"].value = raw_line
+
+            if qty_val is not None and unit_val is not None:
+                ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
+            else:
+                ws[f"{COL_TOTAL}{current_row}"].value = None
+
+            # Track previous primary sign code ONLY for real priced sign rows
+            if is_priced_row and code:
+                prev_primary_code = code
 
         # Bold subsection headers + subtotal rows (description cell only)
         if is_bold_description_row(raw_line) and not code:
@@ -536,6 +571,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
         current_row += 1
         item_num += 1
+
 
     totals = estimate_data.get("totals", {}) or {}
     grand_total = safe_num(totals.get("total"))
