@@ -524,7 +524,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     current_row = BODY_START
     item_num = 1
 
-    prev_priced_primary_code = None
+    prev_primary_code = None
     prev_row_was_priced_primary = False
 
     for sign in sign_types:
@@ -552,7 +552,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
                 ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
 
             # Reset chaining so a later priced row can't accidentally become an alternate
-            prev_priced_primary_code = None
+            prev_primary_code = None
             prev_row_was_priced_primary = False
 
             current_row += 1
