@@ -260,6 +260,8 @@ def restore_merges(ws, merges: List[str], footer_start_row: int, row_offset: int
 
 def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
     ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
+    # Ensure the destination row is not hidden
+    ws.row_dimensions[dst_row].hidden = False
     for col in range(1, max_col + 1):
         src = ws.cell(row=src_row, column=col)
         dst = ws.cell(row=dst_row, column=col)
@@ -555,6 +557,9 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
             prev_priced_primary_code = None
             prev_row_was_priced_primary = False
 
+            # Ensure row is visible
+            ws.row_dimensions[current_row].hidden = False
+
             current_row += 1
             item_num += 1
             continue
@@ -597,6 +602,9 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
             # update "previous primary" tracking
             prev_priced_primary_code = code_key if code_key else None
             prev_row_was_priced_primary = bool(prev_priced_primary_code)
+
+        # Ensure row is visible
+        ws.row_dimensions[current_row].hidden = False
 
         current_row += 1
         item_num += 1
