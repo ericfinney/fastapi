@@ -117,6 +117,14 @@ def is_bold_description_row(text: str) -> bool:
         return False
     return bool(SIGN_PACKAGE_HEADER_RE_EXCEL.search(t) or SUBTOTAL_ROW_RE.search(t))
 
+# Robust sign code token for Alternate detection
+SIGN_CODE_TOKEN_RE = re.compile(r'^\s*([A-Za-z]\.[0-9A-Za-z.]+)\b')
+
+def extract_sign_code(raw: str) -> str:
+    if not raw:
+        return ""
+    m = SIGN_CODE_TOKEN_RE.search(str(raw))
+    return m.group(1).strip() if m else ""
 
 # =========================================================
 # Lock/Unlock helpers
@@ -503,82 +511,96 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     total_body_rows_needed = sign_count + EXTRA_BLANK
     body_last_row = BODY_START + total_body_rows_needed - 1
 
+    # ---------------- Write sign lines ----------------
     COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
     current_row = BODY_START
     item_num = 1
 
-    prev_priced_primary_code = None
+    # Track only the immediately previous priced PRIMARY sign code (for consecutive Alternates)
+    prev_priced_code = None
     prev_row_was_priced_primary = False
 
     for sign in sign_types:
-        raw_line = safe_str(sign.get("sign_type"))
+        ws[f"{COL_ITEM}{current_row}"].value = item_num
+
+        raw_type = safe_str(sign.get("sign_type"))
         qty_val = safe_num(sign.get("qty"))
         unit_val = safe_num(sign.get("unit_price"))
 
-        code, summary = split_sign_type_and_summary(raw_line)
-
-        is_header_or_subtotal = is_bold_description_row(raw_line)   # SIGN PACKAGE or "* Subtotal $..."
-        is_spacer = (raw_line.strip() == "")
         is_priced_row = (qty_val is not None and unit_val is not None)
 
-        # ✅ Any non-priced row breaks "consecutive priced rows" alternates
-        if (not is_priced_row) or is_header_or_subtotal or is_spacer:
-            prev_row_was_priced_primary = False
-            prev_priced_primary_code = None
+        # Special rows (subsection header, subtotal rows, spacer rows) are description-only
+        is_header_or_subtotal = is_bold_description_row(raw_type)
+        is_spacer = (raw_type.strip() == "")
+        is_special = is_header_or_subtotal or is_spacer or (not is_priced_row and unit_val is None)
 
-        # Alternate only when the PREVIOUS row was a priced primary with same code
+        # Any special/non-priced row breaks alternate chaining
+        if is_special or (not is_priced_row):
+            prev_priced_code = None
+            prev_row_was_priced_primary = False
+
+        # Determine sign code + description for display
+        clean_type, summary = split_sign_type_and_summary(raw_type)
+        code_key = extract_sign_code(raw_type)
+
+        # Fallback if regex failed but split returned something code-like
+        if not code_key and looks_like_sign_code(clean_type):
+            code_key = clean_type
+
+        desc_summary = summary.strip() if summary else safe_str(sign.get("description")).strip()
+        if not desc_summary:
+            desc_summary = raw_type.strip()
+
+        # If this is a special row, write description only (bold if header/subtotal)
+        if is_special and not is_priced_row:
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
+            ws[f"{COL_QTY}{current_row}"].value = None
+            ws[f"{COL_UNIT}{current_row}"].value = None
+            ws[f"{COL_TOTAL}{current_row}"].value = None
+            ws[f"{COL_DESC}{current_row}"].value = raw_type
+
+            if is_header_or_subtotal:
+                ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
+
+            current_row += 1
+            item_num += 1
+            continue
+
+        # Alternate ONLY when the previous row was a priced primary with the same code_key
         is_alternate = (
             is_priced_row
-            and bool(code)
+            and bool(code_key)
             and prev_row_was_priced_primary
-            and prev_priced_primary_code == code
+            and prev_priced_code == code_key
         )
 
-        ws[f"{COL_ITEM}{current_row}"].value = item_num
-
         if is_alternate:
-            # Alternate row formatting: description + unit price only
+            # Alternate formatting: description + unit only
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
             ws[f"{COL_QTY}{current_row}"].value = None
             ws[f"{COL_TOTAL}{current_row}"].value = None
-
-            alt_desc = summary if summary else raw_line
-            ws[f"{COL_DESC}{current_row}"].value = f"Alternate {alt_desc}".strip()
+            ws[f"{COL_DESC}{current_row}"].value = f"Alternate {desc_summary}".strip()
             ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
 
-            # keep prev_priced_primary_code as-is (still same code)
-            prev_row_was_priced_primary = False  # alternates don't count as primaries
+            # Alternates do not count as "primary" for chaining
+            prev_row_was_priced_primary = False
         else:
-            # Normal behavior
+            # Primary row
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code_key if code_key else clean_type
             ws[f"{COL_QTY}{current_row}"].value = qty_val
-            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
+            ws[f"{COL_DESC}{current_row}"].value = desc_summary
+            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
 
-            if code:
-                ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
-                ws[f"{COL_DESC}{current_row}"].value = summary
-            else:
-                ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-                ws[f"{COL_DESC}{current_row}"].value = raw_line
+            # Total formula only for primary rows
+            ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
 
-            if is_priced_row:
-                ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
-            else:
-                ws[f"{COL_TOTAL}{current_row}"].value = None
-
-            # Only set “previous primary” when this row is priced AND has a real code
-            if is_priced_row and code:
-                prev_priced_primary_code = code
-                prev_row_was_priced_primary = True
-            else:
-                prev_priced_primary_code = None
-                prev_row_was_priced_primary = False
-
-        # Bold subsection headers + subtotal rows (description only)
-        if is_header_or_subtotal and not code:
-            ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
+            # Update previous primary tracking
+            prev_priced_code = code_key
+            prev_row_was_priced_primary = True
 
         current_row += 1
         item_num += 1
+
 
 
     # --- Totals ---
