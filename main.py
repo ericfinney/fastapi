@@ -508,7 +508,8 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     current_row = BODY_START
     item_num = 1
 
-    prev_primary_code = None  # tracks last "primary" sign code for Alternate detection
+    prev_priced_primary_code = None
+    prev_row_was_priced_primary = False
 
     for sign in sign_types:
         raw_line = safe_str(sign.get("sign_type"))
