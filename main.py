@@ -420,7 +420,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
 
     base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
     if not base_url:
-        base_url = "https://fastapi-production-37f6.up.railway.app/"
+        base_url = "http://localhost:8000"
 
     download_url = f"{base_url}/download/{out_name}"
     return JSONResponse({"download_url": download_url, "filename": out_name})
