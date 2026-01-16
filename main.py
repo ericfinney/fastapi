@@ -516,6 +516,10 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
         code, summary = split_sign_type_and_summary(raw_line)
 
+        # Reset alternate tracking on subsection headers, subtotal rows, and spacer rows
+        if raw_line.strip() == "" or is_bold_description_row(raw_line):
+            prev_primary_code = None
+            
         # Identify special rows (headers/subtotals/spacers) — these should not affect alternate tracking
         is_special_row = (qty_val is None and unit_val is None and (raw_line.strip() == "" or is_bold_description_row(raw_line) or code == ""))
 
@@ -523,7 +527,10 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         is_priced_row = (qty_val is not None and unit_val is not None)
         is_alternate = False
         if is_priced_row and code and prev_primary_code == code:
-            is_alternate = True
+            # Only treat as alternate if this row actually looks like a sign line (has a summary/description)
+            if summary.strip() != "":
+                is_alternate = True
+
 
         # Always write item # (you can change this if you want alternates unnumbered)
         ws[f"{COL_ITEM}{current_row}"].value = item_num
