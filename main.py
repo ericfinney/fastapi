@@ -363,6 +363,9 @@ def health_check():
 
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
+    """
+    Action endpoint: expects {"payload": "<JSON string>"} exactly.
+    """
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
@@ -509,7 +512,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         ws[f"{COL_QTY}{current_row}"].value = qty_val
         ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
 
-        # Section header rows naturally fall into the "else" and put the whole line into description.
+        # Section headers and subtotal rows do not split -> whole line lands in description
         if code:
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
             ws[f"{COL_DESC}{current_row}"].value = summary
@@ -549,20 +552,15 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     last_used_row = ws.max_row
     approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
     restore_row_heights(ws, footer_row_heights, footer_row_offset)
-
     apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
     wb.save(output_path)
 
 
 # =============================================================================
-# PDF parsing (with SIGN PACKAGE headers as line items anywhere in the document)
+# PDF parsing (with subsection headers and per-subsection subtotals injected)
 # =============================================================================
 
 # Accept: description qty $ unit $ extended
-# - spacing can be 1+ spaces
-# - unit/extended decimals can be any length (114.1538)
-# - commas supported
-# - allow NO space before the second $ (some PDF text variants)
 LINE_ITEM_RE = re.compile(
     r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*$'
 )
@@ -575,11 +573,13 @@ TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
 SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s+Type\s*&\s+Overall\b', re.I)
 
-# Generic sign package headers like:
-#   BLDG. 03 'WELLNESS' SIGN PACKAGE
-#   BLDG. 04 'METER SHOP' SIGN PACKAGE
-# and in other docs: anything ending with SIGN PACKAGE / SIGNAGE PACKAGE
+# Generic subsection headers: anything ending with SIGN PACKAGE / SIGNAGE PACKAGE
 SIGN_PACKAGE_HEADER_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
+
+# Section headings
+SHIPPING_HEADER_RE = re.compile(r'\bSHIPPING\b', re.I)
+INSTALL_HEADER_RE = re.compile(r'\bINSTALL(?:ATION)?\b', re.I)
+PERMIT_HEADER_RE = re.compile(r'\bPERMIT(?:TING)?\b', re.I)
 
 # Header fields
 DATE_RE = re.compile(r'\bDate\s+(\d{1,2}/\d{1,2}/\d{2,4})\b', re.I)
@@ -594,6 +594,7 @@ PE_RE = re.compile(r'\bProject\s+Engineer\s*:\s*(.+)$', re.I)
 
 CITY_STATE_ZIP_RE = re.compile(r'([A-Za-z .\'&/-]+)\s*,\s*([A-Z]{2})\s*(\d{5})(?:-\d{4})?')
 
+
 def _init_data() -> Dict[str, Any]:
     return {
         "estimate_date": "",
@@ -607,6 +608,7 @@ def _init_data() -> Dict[str, Any]:
         "sign_types": [],
         "shipping": [],
         "installation": [],
+        "permitting": [],   # NEW (kept for completeness; not currently written to Excel)
         "totals": {"sub_total": None, "mark_up": None, "total": None}
     }
 
@@ -681,7 +683,7 @@ def _apply_totals_extraction(data: Dict[str, Any], line: str):
 def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     """
     Only parse summary rows with prices.
-    Require '$' to avoid dimension/component rows.
+    Require '$' to avoid component/dimension lines.
     """
     if not line or not line.strip():
         return None
@@ -776,44 +778,71 @@ def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
                 data["sold_to"]["phone"] = phone
             break
 
-def _append_sign_section_header(data: Dict[str, Any], header_line: str, last_header: str) -> str:
-    hdr = (header_line or "").strip()
-    if not hdr:
-        return last_header
-    # Avoid duplicates when a header repeats across page breaks
-    if last_header and hdr == last_header:
-        return last_header
-
+def _append_sign_row_text_only(data: Dict[str, Any], text: str):
+    """
+    Add a row that only populates the description column in Excel.
+    We do this by setting sign_type to the full text and leaving qty/unit/ext empty.
+    """
+    t = (text or "").strip()
+    if not t:
+        return
     data["sign_types"].append({
-        "sign_type": hdr,
+        "sign_type": t,
         "qty": None,
         "unit_price": None,
         "extended_total": None
     })
-    return hdr
+
+def _fmt_money(v: float) -> str:
+    return f"{v:,.2f}"
+
+def _flush_subsection_subtotals_into_sign_types(
+    data: Dict[str, Any],
+    ship_sub: float,
+    inst_sub: float,
+    perm_sub: float
+):
+    """
+    Inserts subtotal rows into sign_types BEFORE the next subsection header.
+    Rows are description-only in Excel.
+    """
+    if ship_sub > 0:
+        _append_sign_row_text_only(data, f"Shipping Subtotal ${_fmt_money(ship_sub)}")
+    if inst_sub > 0:
+        _append_sign_row_text_only(data, f"Install Subtotal ${_fmt_money(inst_sub)}")
+    if perm_sub > 0:
+        _append_sign_row_text_only(data, f"Permitting Subtotal ${_fmt_money(perm_sub)}")
 
 def _section_from_line(current: str, line: str) -> str:
     # Totals stop parsing sections
     if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
         return "totals"
 
-    # Shipping / Installation headings
-    if re.search(r'\bSHIPPING\s+PACKAGE\b', line, re.I) or re.search(r'^\s*SHIPPING\b', line, re.I):
+    # Headings (broad)
+    if SHIPPING_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "shipping"
-    if re.search(r'\bINSTALL(?:ATION)?\s+PACKAGE\b', line, re.I) or re.search(r'^\s*INSTALL(?:ATION)?\b', line, re.I):
+    if INSTALL_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "installation"
+    if PERMIT_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
+        return "permitting"
 
-    # Repeating sign table header
+    # Repeating sign table header usually indicates signage table
     if SIGN_TABLE_HEADER_RE.search(line):
-        if current not in ("shipping", "installation"):
+        if current not in ("shipping", "installation", "permitting"):
             return "signage"
 
-    # Note: SIGN_PACKAGE_HEADER_RE is handled *before* this in the main loop so it can override any section.
     return current
+
 
 def parse_boyd_estimate_from_text(text: str) -> dict:
     data = _init_data()
     section = "other"
+
+    # Track per-subsection totals
+    ship_sub = 0.0
+    inst_sub = 0.0
+    perm_sub = 0.0
+
     last_sign_header = ""
 
     lines = [line for line in (text or "").split("\n")]
@@ -825,12 +854,18 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
         _apply_header_extraction(data, line)
         _apply_totals_extraction(data, line)
 
-        # ✅ CRITICAL FIX:
-        # Always treat SIGN PACKAGE header lines as sign section headers,
-        # even if we're currently in installation/shipping. In your PDF,
-        # BLDG. 04 ... SIGN PACKAGE occurs after installation content. :contentReference[oaicite:1]{index=1}
+        # Subsection header encountered:
+        # Before starting a NEW subsection, inject the previous subsection's subtotals (if any)
         if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
-            last_sign_header = _append_sign_section_header(data, line, last_sign_header)
+            if last_sign_header:
+                _flush_subsection_subtotals_into_sign_types(data, ship_sub, inst_sub, perm_sub)
+            ship_sub = inst_sub = perm_sub = 0.0
+
+            hdr = line.strip()
+            if hdr and hdr != last_sign_header:
+                _append_sign_row_text_only(data, hdr)
+                last_sign_header = hdr
+
             section = "signage"
             continue
 
@@ -839,6 +874,10 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
         parsed = _parse_line_item(line)
         if not parsed:
             continue
+
+        ext_val = parsed.get("extended_total")
+        if ext_val is None:
+            ext_val = 0.0
 
         if section == "signage":
             data["sign_types"].append({
@@ -855,6 +894,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
                 "extended_total": parsed["extended_total"],
                 "notes": ""
             })
+            ship_sub += float(ext_val or 0.0)
         elif section == "installation":
             data["installation"].append({
                 "description": parsed["description"],
@@ -863,12 +903,30 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
                 "extended_total": parsed["extended_total"],
                 "notes": ""
             })
+            inst_sub += float(ext_val or 0.0)
+        elif section == "permitting":
+            data["permitting"].append({
+                "description": parsed["description"],
+                "qty": parsed["qty"],
+                "unit_price": parsed["unit_price"],
+                "extended_total": parsed["extended_total"],
+                "notes": ""
+            })
+            perm_sub += float(ext_val or 0.0)
 
+    # NOTE: You asked to insert these rows before the *next* subsection starts.
+    # So we do NOT automatically inject the last subsection totals at EOF.
     return data
+
 
 def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
     data = _init_data()
     section = "other"
+
+    ship_sub = 0.0
+    inst_sub = 0.0
+    perm_sub = 0.0
+
     last_sign_header = ""
 
     for page_index, page in enumerate(reader.pages):
@@ -884,9 +942,16 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
             _apply_header_extraction(data, line)
             _apply_totals_extraction(data, line)
 
-            # ✅ Same fix in streaming mode:
             if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
-                last_sign_header = _append_sign_section_header(data, line, last_sign_header)
+                if last_sign_header:
+                    _flush_subsection_subtotals_into_sign_types(data, ship_sub, inst_sub, perm_sub)
+                ship_sub = inst_sub = perm_sub = 0.0
+
+                hdr = line.strip()
+                if hdr and hdr != last_sign_header:
+                    _append_sign_row_text_only(data, hdr)
+                    last_sign_header = hdr
+
                 section = "signage"
                 continue
 
@@ -895,6 +960,10 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
             parsed = _parse_line_item(line)
             if not parsed:
                 continue
+
+            ext_val = parsed.get("extended_total")
+            if ext_val is None:
+                ext_val = 0.0
 
             if section == "signage":
                 data["sign_types"].append({
@@ -911,6 +980,7 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                     "extended_total": parsed["extended_total"],
                     "notes": ""
                 })
+                ship_sub += float(ext_val or 0.0)
             elif section == "installation":
                 data["installation"].append({
                     "description": parsed["description"],
@@ -919,6 +989,16 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                     "extended_total": parsed["extended_total"],
                     "notes": ""
                 })
+                inst_sub += float(ext_val or 0.0)
+            elif section == "permitting":
+                data["permitting"].append({
+                    "description": parsed["description"],
+                    "qty": parsed["qty"],
+                    "unit_price": parsed["unit_price"],
+                    "extended_total": parsed["extended_total"],
+                    "notes": ""
+                })
+                perm_sub += float(ext_val or 0.0)
 
     return data
 
@@ -961,7 +1041,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
                 estimate_data = parse_boyd_estimate_from_text(text)
 
         items_count = len(estimate_data.get("sign_types", []))
-        logging.info("Parsed sign line items (including section headers): %d", items_count)
+        logging.info("Parsed sign line items (including subsection headers and subtotals): %d", items_count)
 
         if items_count == 0:
             raise HTTPException(
