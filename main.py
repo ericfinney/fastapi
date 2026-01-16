@@ -128,6 +128,12 @@ def extract_sign_code_strict(raw: str) -> str:
     m = SIGN_CODE_STRICT_RE.search(str(raw))
     return m.group(1).strip() if m else ""
 
+FALLBACK_CODE_RE = re.compile(r'^\s*([A-Za-z]\d+(?:\.\d+)*)\b')
+
+def extract_sign_code_fallback(raw: str) -> str:
+    m = FALLBACK_CODE_RE.search(raw or "")
+    return m.group(1).strip() if m else ""
+
 
 # =========================================================
 # Lock/Unlock helpers
@@ -559,16 +565,22 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         code_key = extract_sign_code_strict(raw_line)
         if not code_key:
             # fallback to split_code for cases like "E1 - ..." without dot
-            code_key = split_code.strip() if split_code else ""
+            code_key = code_from_strict or extract_sign_code_fallback(raw_line) or (split_code.strip() if split_code else "")
 
         desc_summary = split_desc.strip() if split_desc else raw_line.strip()
 
-        # Alternate ONLY when the immediately previous row was a priced PRIMARY with same code
+        # code_key should be the strict code if possible
+        code_from_strict = extract_sign_code_strict(raw_line)
+        split_code, split_desc = split_sign_type_and_summary(raw_line)
+
+        code_key = code_from_strict or (split_code.strip() if split_code else "")
+        desc_summary = (split_desc.strip() if split_desc else raw_line.strip())
+
+        # ✅ Alternate ONLY if the immediately previous row was a priced PRIMARY with the SAME code
         is_alternate = (
-            is_priced_row
-            and bool(code_key)
+            bool(code_key)
             and prev_row_was_priced_primary
-            and prev_priced_primary_code == code_key
+            and prev_primary_code == code_key
         )
 
         if is_alternate:
