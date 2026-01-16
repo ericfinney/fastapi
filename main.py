@@ -524,7 +524,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     current_row = BODY_START
     item_num = 1
 
-    prev_primary_code = None
+    prev_priced_primary_code = None
     prev_row_was_priced_primary = False
 
     for sign in sign_types:
@@ -551,8 +551,8 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
             if is_header_or_subtotal:
                 ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
 
-            # Reset chaining so a later priced row can't accidentally become an alternate
-            prev_primary_code = None
+            # reset alternate chaining
+            prev_priced_primary_code = None
             prev_row_was_priced_primary = False
 
             current_row += 1
@@ -562,48 +562,45 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         # Determine code + description
         split_code, split_desc = split_sign_type_and_summary(raw_line)
 
-        code_key = extract_sign_code_strict(raw_line)
-        if not code_key:
-            # fallback to split_code for cases like "E1 - ..." without dot
-            code_key = code_from_strict or extract_sign_code_fallback(raw_line) or (split_code.strip() if split_code else "")
-
-        desc_summary = split_desc.strip() if split_desc else raw_line.strip()
-
-        # code_key should be the strict code if possible
-        code_from_strict = extract_sign_code_strict(raw_line)
-        split_code, split_desc = split_sign_type_and_summary(raw_line)
-
-        code_key = code_from_strict or (split_code.strip() if split_code else "")
+        # Prefer strict code if present; fallback to split_code or fallback extractor
+        code_key = extract_sign_code_strict(raw_line) or extract_sign_code_fallback(raw_line) or (split_code.strip() if split_code else "")
         desc_summary = (split_desc.strip() if split_desc else raw_line.strip())
 
-        # ✅ Alternate ONLY if the immediately previous row was a priced PRIMARY with the SAME code
+        # ✅ Alternate rule:
+        # If two consecutive PRICED rows have the same sign code,
+        # the second row becomes an Alternate (description + unit price only).
         is_alternate = (
-            bool(code_key)
+            is_priced_row
+            and bool(code_key)
             and prev_row_was_priced_primary
-            and prev_primary_code == code_key
+            and prev_priced_primary_code == code_key
         )
 
         if is_alternate:
+            # Alternate row output: ONLY description + unit price
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
             ws[f"{COL_QTY}{current_row}"].value = None
             ws[f"{COL_TOTAL}{current_row}"].value = None
             ws[f"{COL_DESC}{current_row}"].value = f"Alternate {desc_summary}".strip()
             ws[f"{COL_UNIT}{current_row}"].value = unit_cell_val
 
-            # Alternates are not primaries; keep prev_priced_primary_code as-is, but stop chaining
+            # alternates do not become primaries
             prev_row_was_priced_primary = False
         else:
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code_key if code_key else (split_code or None)
+            # Primary priced row output (normal)
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code_key if code_key else None
             ws[f"{COL_QTY}{current_row}"].value = qty_val
             ws[f"{COL_DESC}{current_row}"].value = desc_summary
             ws[f"{COL_UNIT}{current_row}"].value = unit_cell_val
             ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
 
+            # update "previous primary" tracking
             prev_priced_primary_code = code_key if code_key else None
             prev_row_was_priced_primary = bool(prev_priced_primary_code)
 
         current_row += 1
         item_num += 1
+
 
     # --- Totals ---
     totals = estimate_data.get("totals", {}) or {}
