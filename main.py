@@ -40,7 +40,11 @@ SUBTOTAL_EPSILON = 0.005
 
 SUBTOTAL_ROW_RE = re.compile(r'^\s*(Shipping|Install|Permitting)\s+Subtotal\s+\$', re.I)
 SIGN_PACKAGE_HEADER_RE_EXCEL = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
+
+# Strict sign code: letter '.' digit ... (prevents BLDG. from matching)
 SIGN_CODE_STRICT_RE = re.compile(r'^\s*([A-Za-z]\.(?:\d+[A-Za-z0-9]*)(?:\.\d+[A-Za-z0-9]*)*)\b')
+# Non-anchored strict sign code (for finding embedded codes inside a merged description)
+SIGN_CODE_STRICT_ANYWHERE_RE = re.compile(r'([A-Za-z]\.(?:\d+[A-Za-z0-9]*)(?:\.\d+[A-Za-z0-9]*)*)\s*[-–—]')
 
 
 # =========================================================
@@ -123,6 +127,7 @@ def extract_sign_code_strict(raw: str) -> str:
         return ""
     m = SIGN_CODE_STRICT_RE.search(str(raw))
     return m.group(1).strip() if m else ""
+
 
 # =========================================================
 # Lock/Unlock helpers
@@ -223,10 +228,10 @@ def shift_range_overlap_safe(a1_range: str, footer_start_row: int, row_offset: i
     bottom = max(a_row, b_row)
     should_shift = (top >= footer_start_row) or (top < footer_start_row <= bottom)
 
-    def apply_shift(ref):
-        col, row = split_ref(ref)
+    def apply_shift(ref2):
+        col, row = split_ref(ref2)
         if row is None:
-            return ref
+            return ref2
         if should_shift:
             row += row_offset
         return f"{col}{row}"
@@ -551,7 +556,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         # Determine code + description
         split_code, split_desc = split_sign_type_and_summary(raw_line)
 
-        # IMPORTANT: strict sign-code matching avoids "BLDG." poisoning the chain
         code_key = extract_sign_code_strict(raw_line)
         if not code_key:
             # fallback to split_code for cases like "E1 - ..." without dot
@@ -588,8 +592,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
         current_row += 1
         item_num += 1
-
-
 
     # --- Totals ---
     totals = estimate_data.get("totals", {}) or {}
@@ -740,6 +742,30 @@ def _apply_totals_extraction(data: Dict[str, Any], line: str):
     if data["totals"]["total"] is None and TOTAL_RE.search(line):
         data["totals"]["total"] = _extract_money(line)
 
+def _normalize_merged_description(description: str) -> str:
+    """
+    If PDF text extraction merges two sign lines into one description, it can look like:
+      "B.5.1 - ... E.1 - Maximum Occupancy (As Spec'd)"
+    while qty/unit/extended belong to the E.1 line.
+
+    We fix this by finding the LAST strict sign-code token in the description
+    and slicing description from that token onward.
+    """
+    if not description:
+        return description
+
+    matches = list(SIGN_CODE_STRICT_ANYWHERE_RE.finditer(description))
+    if not matches:
+        return description
+
+    last = matches[-1]
+    start = last.start()
+    # Only slice if the last token isn't already at the beginning
+    if start > 0:
+        return description[start:].strip()
+
+    return description
+
 def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     if not line or not line.strip():
         return None
@@ -751,6 +777,8 @@ def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
         return None
 
     description = m.group(1).strip()
+    description = _normalize_merged_description(description)
+
     qty_raw = m.group(2).strip()
     unit_raw = m.group(3).strip().replace(",", "")
     ext_raw = m.group(4).strip().replace(",", "")
@@ -839,7 +867,6 @@ def _append_sign_row_text_only(data: Dict[str, Any], text: str):
     Add a row that only populates the description column in Excel.
     IMPORTANT: allow truly blank spacer rows (text == "").
     """
-    # ✅ allow empty string so we can create a spacer row
     if text is None:
         return
     data["sign_types"].append({
@@ -921,7 +948,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
             if last_sign_header:
                 _flush_subsection_subtotals_into_sign_types(
                     data, ship_sub, inst_sub, perm_sub,
-                    add_blank_row_after=True  # ✅ spacer before next subsection header
+                    add_blank_row_after=True
                 )
             ship_sub = inst_sub = perm_sub = 0.0
 
@@ -976,7 +1003,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
             })
             perm_sub += float(ext_val)
 
-    # ✅ EOF flush for final subsection (no spacer at EOF)
+    # EOF flush for final subsection
     if last_sign_header:
         _flush_subsection_subtotals_into_sign_types(
             data, ship_sub, inst_sub, perm_sub,
@@ -1068,7 +1095,7 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                 })
                 perm_sub += float(ext_val)
 
-    # ✅ EOF flush for final subsection (no spacer at EOF)
+    # EOF flush for final subsection
     if last_sign_header:
         _flush_subsection_subtotals_into_sign_types(
             data, ship_sub, inst_sub, perm_sub,
@@ -1107,7 +1134,10 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
                 total_chars += len(t)
                 text_parts.append(t)
                 if total_chars > MAX_EXTRACTED_TEXT_CHARS:
-                    logging.info("Extracted text exceeds %d chars; switching to streaming fallback.", MAX_EXTRACTED_TEXT_CHARS)
+                    logging.info(
+                        "Extracted text exceeds %d chars; switching to streaming fallback.",
+                        MAX_EXTRACTED_TEXT_CHARS
+                    )
                     estimate_data = parse_boyd_estimate_streaming(reader)
                     break
 
