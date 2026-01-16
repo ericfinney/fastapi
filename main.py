@@ -503,88 +503,86 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     total_body_rows_needed = sign_count + EXTRA_BLANK
     body_last_row = BODY_START + total_body_rows_needed - 1
 
-# --- Write sign line items into the body table (with Alternates + bold headers/subtotals) ---
+    # --- Write sign line items into the body table (with Alternates + bold headers/subtotals) ---
+    COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
+    current_row = BODY_START
+    item_num = 1
 
-COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
-current_row = BODY_START
-item_num = 1
+    prev_primary_code = None  # tracks last "primary" sign code for Alternate detection
 
-prev_primary_code = None  # tracks last "primary" sign code for Alternate detection
+    for sign in sign_types:
+        raw_line = safe_str(sign.get("sign_type"))
+        qty_val = safe_num(sign.get("qty"))
+        unit_val = safe_num(sign.get("unit_price"))
 
-for sign in sign_types:
-    raw_line = safe_str(sign.get("sign_type"))
-    qty_val = safe_num(sign.get("qty"))
-    unit_val = safe_num(sign.get("unit_price"))
+        code, summary = split_sign_type_and_summary(raw_line)
 
-    code, summary = split_sign_type_and_summary(raw_line)
+        # Treat subsection headers / subtotal rows / spacer rows as "special"
+        is_header_or_subtotal = is_bold_description_row(raw_line)  # SIGN PACKAGE or "* Subtotal $..."
+        is_spacer = (raw_line.strip() == "")
+        is_special_row = is_header_or_subtotal or is_spacer
 
-    # Treat subsection headers / subtotal rows / spacer rows as "special"
-    is_header_or_subtotal = is_bold_description_row(raw_line)  # SIGN PACKAGE or "* Subtotal $..."
-    is_spacer = (raw_line.strip() == "")
-    is_special_row = is_header_or_subtotal or is_spacer
+        # ✅ Reset alternate tracking whenever we hit a special row
+        # (prevents the first real row after a header/subtotal from being mis-treated as an Alternate)
+        if is_special_row:
+            prev_primary_code = None
 
-    # ✅ Reset alternate tracking whenever we hit a special row
-    # (prevents the first real row after a header/subtotal from being mis-treated as an Alternate)
-    if is_special_row:
-        prev_primary_code = None
+        is_priced_row = (qty_val is not None and unit_val is not None)
+        is_alternate = False
 
-    is_priced_row = (qty_val is not None and unit_val is not None)
-    is_alternate = False
+        # Detect Alternate: consecutive priced rows with the same sign code
+        if is_priced_row and code and prev_primary_code == code:
+            # Only treat as alternate if there's a usable description/summary
+            if summary.strip() != "":
+                is_alternate = True
 
-    # Detect Alternate: consecutive priced rows with the same sign code
-    if is_priced_row and code and prev_primary_code == code:
-        # Only treat as alternate if there's a usable description/summary
-        if summary.strip() != "":
-            is_alternate = True
+        # Item # (keep numbering consistent across all rows)
+        ws[f"{COL_ITEM}{current_row}"].value = item_num
 
-    # Item # (keep numbering consistent across all rows)
-    ws[f"{COL_ITEM}{current_row}"].value = item_num
-
-    if is_alternate:
-        # Alternate row rules:
-        # - no sign type, no qty, no total
-        # - description prefixed with "Alternate "
-        # - unit price retained
-        ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-        ws[f"{COL_QTY}{current_row}"].value = None
-        ws[f"{COL_TOTAL}{current_row}"].value = None
-
-        alt_desc = summary if summary else raw_line
-        ws[f"{COL_DESC}{current_row}"].value = f"Alternate {alt_desc}".strip()
-
-        ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
-
-        # Do NOT update prev_primary_code (we keep it so multiple alternates stay chained)
-    else:
-        # Normal behavior:
-        ws[f"{COL_QTY}{current_row}"].value = qty_val
-        ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
-
-        if code:
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
-            ws[f"{COL_DESC}{current_row}"].value = summary
-        else:
+        if is_alternate:
+            # Alternate row rules:
+            # - no sign type, no qty, no total
+            # - description prefixed with "Alternate "
+            # - unit price retained
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-            ws[f"{COL_DESC}{current_row}"].value = raw_line
-
-        if qty_val is not None and unit_val is not None:
-            ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
-        else:
+            ws[f"{COL_QTY}{current_row}"].value = None
             ws[f"{COL_TOTAL}{current_row}"].value = None
 
-        # Track previous PRIMARY sign code only for real priced sign rows with a code
-        if is_priced_row and code:
-            prev_primary_code = code
+            alt_desc = summary if summary else raw_line
+            ws[f"{COL_DESC}{current_row}"].value = f"Alternate {alt_desc}".strip()
 
-    # Bold subsection headers + subtotal rows (description cell only)
-    if is_header_or_subtotal and not code:
-        ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
+            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
 
-    current_row += 1
-    item_num += 1
+            # Do NOT update prev_primary_code (we keep it so multiple alternates stay chained)
+        else:
+            # Normal behavior:
+            ws[f"{COL_QTY}{current_row}"].value = qty_val
+            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
 
+            if code:
+                ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
+                ws[f"{COL_DESC}{current_row}"].value = summary
+            else:
+                ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
+                ws[f"{COL_DESC}{current_row}"].value = raw_line
 
+            if qty_val is not None and unit_val is not None:
+                ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
+            else:
+                ws[f"{COL_TOTAL}{current_row}"].value = None
 
+            # Track previous PRIMARY sign code only for real priced sign rows with a code
+            if is_priced_row and code:
+                prev_primary_code = code
+
+        # Bold subsection headers + subtotal rows (description cell only)
+        if is_header_or_subtotal and not code:
+            ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
+
+        current_row += 1
+        item_num += 1
+
+    # --- Totals ---
     totals = estimate_data.get("totals", {}) or {}
     grand_total = safe_num(totals.get("total"))
 
@@ -606,10 +604,12 @@ for sign in sign_types:
     if grand_total is not None:
         write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
 
+    # --- Layout / protection ---
     last_used_row = ws.max_row
     approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
     restore_row_heights(ws, footer_row_heights, footer_row_offset)
     apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
+
     wb.save(output_path)
 
 
