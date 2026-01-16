@@ -11,7 +11,7 @@ from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
-from openpyxl.styles import Protection
+from openpyxl.styles import Protection, Font
 
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -31,8 +31,12 @@ MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-app = FastAPI()
+app = FastAPI()f
 
+SUBTOTAL_EPSILON = 0.005  # treat anything under half-cent as zero
+
+SUBTOTAL_ROW_RE = re.compile(r'^\s*(Shipping|Install|Permitting)\s+Subtotal\s+\$', re.I)
+SIGN_PACKAGE_HEADER_RE_EXCEL = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
 
 # =========================================================
 # Cleanup: delete old generated workbooks
@@ -103,6 +107,11 @@ def insert_logo(ws):
     img = XLImage(LOGO_PATH)
     ws.add_image(img, "A1")
 
+def is_bold_description_row(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(SIGN_PACKAGE_HEADER_RE_EXCEL.search(t) or SUBTOTAL_ROW_RE.search(t))
 
 # =========================================================
 # Lock/Unlock helpers
@@ -525,6 +534,11 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         else:
             ws[f"{COL_TOTAL}{current_row}"].value = None
 
+        # Bold subsection headers + subtotal rows (description cell only)
+        if is_bold_description_row(raw_line) and not code:
+            desc_cell = ws[f"{COL_DESC}{current_row}"]
+            desc_cell.font = Font(bold=True)
+            
         current_row += 1
         item_num += 1
 
@@ -800,18 +814,35 @@ def _flush_subsection_subtotals_into_sign_types(
     data: Dict[str, Any],
     ship_sub: float,
     inst_sub: float,
-    perm_sub: float
+    perm_sub: float,
+    add_blank_row_after: bool = False
 ):
     """
     Inserts subtotal rows into sign_types BEFORE the next subsection header.
     Rows are description-only in Excel.
+
+    Guard: does not emit rows when subtotal is effectively zero (abs < SUBTOTAL_EPSILON).
     """
-    if ship_sub > 0:
+    def is_effectively_zero(v: float) -> bool:
+        return v is None or abs(float(v)) < SUBTOTAL_EPSILON
+
+    emitted_any = False
+
+    if not is_effectively_zero(ship_sub):
         _append_sign_row_text_only(data, f"Shipping Subtotal ${_fmt_money(ship_sub)}")
-    if inst_sub > 0:
+        emitted_any = True
+
+    if not is_effectively_zero(inst_sub):
         _append_sign_row_text_only(data, f"Install Subtotal ${_fmt_money(inst_sub)}")
-    if perm_sub > 0:
+        emitted_any = True
+
+    if not is_effectively_zero(perm_sub):
         _append_sign_row_text_only(data, f"Permitting Subtotal ${_fmt_money(perm_sub)}")
+        emitted_any = True
+
+    # Add a blank spacer row between the last subtotal and the next subsection header
+    if add_blank_row_after and emitted_any:
+        _append_sign_row_text_only(data, "")
 
 def _section_from_line(current: str, line: str) -> str:
     # Totals stop parsing sections
@@ -858,8 +889,12 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
         # Before starting a NEW subsection, inject the previous subsection's subtotals (if any)
         if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
             if last_sign_header:
-                _flush_subsection_subtotals_into_sign_types(data, ship_sub, inst_sub, perm_sub)
+                _flush_subsection_subtotals_into_sign_types(
+                    data, ship_sub, inst_sub, perm_sub,
+                    add_blank_row_after=False  # <-- spacer before next subsection header
+                )
             ship_sub = inst_sub = perm_sub = 0.0
+
 
             hdr = line.strip()
             if hdr and hdr != last_sign_header:
@@ -914,9 +949,15 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
             })
             perm_sub += float(ext_val or 0.0)
 
-    # NOTE: You asked to insert these rows before the *next* subsection starts.
-    # So we do NOT automatically inject the last subsection totals at EOF.
+    
+    if last_sign_header:
+        _flush_subsection_subtotals_into_sign_types(
+            data, ship_sub, inst_sub, perm_sub,
+            add_blank_row_after=False
+    )
+
     return data
+
 
 
 def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
@@ -999,6 +1040,9 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                     "notes": ""
                 })
                 perm_sub += float(ext_val or 0.0)
+
+    if last_sign_header:
+        _flush_subsection_subtotals_into_sign_types(data, ship_sub, inst_sub, perm_sub)
 
     return data
 
