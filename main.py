@@ -3,11 +3,7 @@ import uuid
 import json
 import logging
 import re
-import math
 import time
-import zipfile
-import tempfile
-import shutil
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -30,12 +26,11 @@ SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
 
-# If a PDF is huge, switch to streaming parsing (page-by-page).
+# Fallback mode for big PDFs:
 MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 app = FastAPI()
 
 
@@ -141,7 +136,7 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 
 # =========================================================
 # Sign type + summary split (Excel display only)
-# JSON keeps sign_type EXACTLY as PDF (for real sign lines and header lines).
+# JSON keeps sign_type EXACTLY as PDF.
 # =========================================================
 TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
 
@@ -168,14 +163,12 @@ def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
     s = str(raw).strip()
     if not s:
         return "", ""
-
     parts = TYPE_DESC_SPLIT_RE.split(s, maxsplit=1)
     if len(parts) == 2:
         code = parts[0].strip()
         summary = parts[1].strip()
         if looks_like_sign_code(code):
             return code, summary
-
     return "", s
 
 
@@ -213,7 +206,6 @@ def shift_range_overlap_safe(a1_range: str, footer_start_row: int, row_offset: i
 
     top = min(a_row, b_row)
     bottom = max(a_row, b_row)
-
     should_shift = (top >= footer_start_row) or (top < footer_start_row <= bottom)
 
     def apply_shift(ref):
@@ -274,7 +266,6 @@ def adjust_body_rows_preserve_footer(
 
     merges = save_merged_ranges(ws)
     unmerge_all(ws, merges)
-
     max_col = ws.max_column
 
     if diff > 0:
@@ -342,10 +333,8 @@ def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
     for rng in ws.merged_cells.ranges:
         min_row, max_row = rng.min_row, rng.max_row
         min_col, max_col = rng.min_col, rng.max_col
-
         rows_intersect = not (max_row < body_row_start or min_row > body_row_end)
         cols_intersect = not (max_col < 2 or min_col > 5)
-
         if rows_intersect and cols_intersect:
             ws.cell(row=min_row, column=min_col).protection = Protection(locked=False)
 
@@ -374,9 +363,6 @@ def health_check():
 
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
-    """
-    Action endpoint: expects {"payload": "<JSON string>"} exactly.
-    """
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
@@ -517,14 +503,13 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         qty_val = safe_num(sign.get("qty"))
         unit_val = safe_num(sign.get("unit_price"))
 
-        # Excel display: "CODE - Summary" -> column B and C
-        # For section headers like "BLDG. 03 'WELLNESS' SIGN PACKAGE", code won't match, so it goes to description cell.
         code, summary = split_sign_type_and_summary(raw_line)
 
         ws[f"{COL_ITEM}{current_row}"].value = item_num
         ws[f"{COL_QTY}{current_row}"].value = qty_val
         ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
 
+        # Section header rows naturally fall into the "else" and put the whole line into description.
         if code:
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
             ws[f"{COL_DESC}{current_row}"].value = summary
@@ -566,19 +551,18 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     restore_row_heights(ws, footer_row_heights, footer_row_offset)
 
     apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
-
     wb.save(output_path)
 
 
 # =============================================================================
-# PDF parsing updated for this estimate format + generic section headers as line items
+# PDF parsing (with SIGN PACKAGE headers as line items anywhere in the document)
 # =============================================================================
 
 # Accept: description qty $ unit $ extended
 # - spacing can be 1+ spaces
 # - unit/extended decimals can be any length (114.1538)
 # - commas supported
-# - allow NO space before the second $ (handles some PDF text variants)
+# - allow NO space before the second $ (some PDF text variants)
 LINE_ITEM_RE = re.compile(
     r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*$'
 )
@@ -589,13 +573,15 @@ SUBTOTAL_RE = re.compile(r'\bSUB[- ]?TOTAL\b', re.I)
 MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
 TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
-# Table header appears each page
 SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s+Type\s*&\s+Overall\b', re.I)
 
-# Generic sign package headers (your docs show lines like "BLDG. 03 'WELLNESS' SIGN PACKAGE") :contentReference[oaicite:3]{index=3}
+# Generic sign package headers like:
+#   BLDG. 03 'WELLNESS' SIGN PACKAGE
+#   BLDG. 04 'METER SHOP' SIGN PACKAGE
+# and in other docs: anything ending with SIGN PACKAGE / SIGNAGE PACKAGE
 SIGN_PACKAGE_HEADER_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
 
-# Page 1 header fields
+# Header fields
 DATE_RE = re.compile(r'\bDate\s+(\d{1,2}/\d{1,2}/\d{2,4})\b', re.I)
 PROJECT_ID_RE = re.compile(r'\bProject\s+Id\s*:\s*(\S+)\b', re.I)
 PROJECT_DESC_RE = re.compile(r'\bProject\s+Desc\.?\s*:\s*(.+?)\s*(?:Ship\s+Via|$)', re.I)
@@ -634,9 +620,6 @@ def _extract_money(line: str) -> Optional[float]:
         return None
 
 def _clean_person_value(raw: str) -> str:
-    """
-    Stops at the next known field label if the PDF flattens multiple labels onto one line.
-    """
     if not raw:
         return ""
     s = raw.strip()
@@ -698,7 +681,7 @@ def _apply_totals_extraction(data: Dict[str, Any], line: str):
 def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     """
     Only parse summary rows with prices.
-    Require a '$' to avoid parsing dimension/component lines.
+    Require '$' to avoid dimension/component rows.
     """
     if not line or not line.strip():
         return None
@@ -721,39 +704,24 @@ def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     unit_price = safe_num(unit_raw)
     extended_total = safe_num(ext_raw)
 
-    return {
-        "description": description,
-        "qty": qty,
-        "unit_price": unit_price,
-        "extended_total": extended_total,
-    }
+    return {"description": description, "qty": qty, "unit_price": unit_price, "extended_total": extended_total}
 
 def _split_two_columns_by_street_numbers(line: str) -> Tuple[str, str]:
-    """
-    PDF text often flattens two columns into one line:
-      "86 Inverness Place North 1600 West 12th Street"
-    Split at the 2nd street-number token.
-    """
     if not line:
         return "", ""
     matches = list(re.finditer(r'\b\d{1,5}\s', line))
     if len(matches) >= 2:
         cut = matches[1].start()
-        left = line[:cut].strip()
-        right = line[cut:].strip()
-        return left, right
+        return line[:cut].strip(), line[cut:].strip()
     return line.strip(), ""
 
 def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
-    """
-    Extract sold_to and ship_to blocks from page-1 style header.
-    """
     if not lines:
         return
 
     idx = None
     sold_name = ship_name = ""
-    for i, raw in enumerate(lines[:50]):
+    for i, raw in enumerate(lines[:60]):
         line = raw.strip()
         m = re.search(r'\bTo:\s*(.*?)\s+Ship\s+To:\s*(.+)$', line, re.I)
         if m:
@@ -761,7 +729,6 @@ def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
             ship_name = m.group(2).strip()
             idx = i
             break
-
     if idx is None:
         return
 
@@ -775,14 +742,16 @@ def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
         left_addr, right_addr = _split_two_columns_by_street_numbers(addr_line)
 
         if left_addr:
-            data["sold_to"]["address_lines"] = data["sold_to"].get("address_lines", []) or []
-            if left_addr not in data["sold_to"]["address_lines"]:
-                data["sold_to"]["address_lines"].append(left_addr)
+            al = data["sold_to"].get("address_lines", []) or []
+            if left_addr not in al:
+                al.append(left_addr)
+            data["sold_to"]["address_lines"] = al
 
         if right_addr:
-            data["ship_to"]["address_lines"] = data["ship_to"].get("address_lines", []) or []
-            if right_addr not in data["ship_to"]["address_lines"]:
-                data["ship_to"]["address_lines"].append(right_addr)
+            al = data["ship_to"].get("address_lines", []) or []
+            if right_addr not in al:
+                al.append(right_addr)
+            data["ship_to"]["address_lines"] = al
 
     if idx + 2 < len(lines):
         csz_line = lines[idx + 2].strip()
@@ -799,7 +768,7 @@ def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
                 if not data["ship_to"].get("state"): data["ship_to"]["state"] = state.strip()
                 if not data["ship_to"].get("zip"): data["ship_to"]["zip"] = z.strip()
 
-    for raw in lines[idx:idx + 15]:
+    for raw in lines[idx:idx + 20]:
         line = raw.strip()
         if re.search(r'\bPhone\b', line, re.I):
             phone = re.sub(r'^\s*Phone\s*', '', line, flags=re.I).strip()
@@ -807,18 +776,11 @@ def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
                 data["sold_to"]["phone"] = phone
             break
 
-def _append_sign_section_header_if_needed(data: Dict[str, Any], header_line: str, last_header: Optional[str]) -> str:
-    """
-    Treat a SIGN PACKAGE header line as its own line item:
-      sign_type = header text (exactly)
-      qty/unit/extended = None
-    This makes it appear in the proposal table with the whole line in the description cell.
-    """
+def _append_sign_section_header(data: Dict[str, Any], header_line: str, last_header: str) -> str:
     hdr = (header_line or "").strip()
     if not hdr:
-        return last_header or ""
-
-    # avoid duplicates if PDF repeats the same header across pages
+        return last_header
+    # Avoid duplicates when a header repeats across page breaks
     if last_header and hdr == last_header:
         return last_header
 
@@ -831,7 +793,7 @@ def _append_sign_section_header_if_needed(data: Dict[str, Any], header_line: str
     return hdr
 
 def _section_from_line(current: str, line: str) -> str:
-    # Totals stop parsing
+    # Totals stop parsing sections
     if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
         return "totals"
 
@@ -841,16 +803,12 @@ def _section_from_line(current: str, line: str) -> str:
     if re.search(r'\bINSTALL(?:ATION)?\s+PACKAGE\b', line, re.I) or re.search(r'^\s*INSTALL(?:ATION)?\b', line, re.I):
         return "installation"
 
-    # The repeating table header indicates we are in the sign table
+    # Repeating sign table header
     if SIGN_TABLE_HEADER_RE.search(line):
-        # don't override if explicitly in shipping/install tables
         if current not in ("shipping", "installation"):
             return "signage"
 
-    # A generic sign package header line indicates sign section too
-    if SIGN_PACKAGE_HEADER_RE.search(line):
-        return "signage"
-
+    # Note: SIGN_PACKAGE_HEADER_RE is handled *before* this in the main loop so it can override any section.
     return current
 
 def parse_boyd_estimate_from_text(text: str) -> dict:
@@ -867,10 +825,13 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
         _apply_header_extraction(data, line)
         _apply_totals_extraction(data, line)
 
-        # Detect section header lines that should become their own sign line item
-        if SIGN_PACKAGE_HEADER_RE.search(line.strip()) and section != "shipping" and section != "installation":
+        # ✅ CRITICAL FIX:
+        # Always treat SIGN PACKAGE header lines as sign section headers,
+        # even if we're currently in installation/shipping. In your PDF,
+        # BLDG. 04 ... SIGN PACKAGE occurs after installation content. :contentReference[oaicite:1]{index=1}
+        if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
+            last_sign_header = _append_sign_section_header(data, line, last_sign_header)
             section = "signage"
-            last_sign_header = _append_sign_section_header_if_needed(data, line, last_sign_header)
             continue
 
         section = _section_from_line(section, line)
@@ -881,7 +842,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
 
         if section == "signage":
             data["sign_types"].append({
-                "sign_type": parsed["description"],  # exact as listed
+                "sign_type": parsed["description"],
                 "qty": parsed["qty"],
                 "unit_price": parsed["unit_price"],
                 "extended_total": parsed["extended_total"],
@@ -923,9 +884,10 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
             _apply_header_extraction(data, line)
             _apply_totals_extraction(data, line)
 
-            if SIGN_PACKAGE_HEADER_RE.search(line.strip()) and section != "shipping" and section != "installation":
+            # ✅ Same fix in streaming mode:
+            if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
+                last_sign_header = _append_sign_section_header(data, line, last_sign_header)
                 section = "signage"
-                last_sign_header = _append_sign_section_header_if_needed(data, line, last_sign_header)
                 continue
 
             section = _section_from_line(section, line)
