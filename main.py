@@ -31,12 +31,16 @@ MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-app = FastAPI()f
 
-SUBTOTAL_EPSILON = 0.005  # treat anything under half-cent as zero
+# ✅ FIX: remove stray "f"
+app = FastAPI()
+
+# Treat anything smaller than half a cent as zero (guards rounding noise)
+SUBTOTAL_EPSILON = 0.005
 
 SUBTOTAL_ROW_RE = re.compile(r'^\s*(Shipping|Install|Permitting)\s+Subtotal\s+\$', re.I)
 SIGN_PACKAGE_HEADER_RE_EXCEL = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
+
 
 # =========================================================
 # Cleanup: delete old generated workbooks
@@ -113,6 +117,7 @@ def is_bold_description_row(text: str) -> bool:
         return False
     return bool(SIGN_PACKAGE_HEADER_RE_EXCEL.search(t) or SUBTOTAL_ROW_RE.search(t))
 
+
 # =========================================================
 # Lock/Unlock helpers
 # =========================================================
@@ -162,11 +167,6 @@ def looks_like_sign_code(code: str) -> bool:
     return True
 
 def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
-    """
-    For Excel layout only:
-      If "CODE - Summary" -> ("CODE", "Summary")
-      Otherwise -> ("", raw)
-    """
     if not raw:
         return "", ""
     s = str(raw).strip()
@@ -372,9 +372,6 @@ def health_check():
 
 @app.post("/generate_proposal")
 def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
-    """
-    Action endpoint: expects {"payload": "<JSON string>"} exactly.
-    """
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
@@ -521,7 +518,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         ws[f"{COL_QTY}{current_row}"].value = qty_val
         ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
 
-        # Section headers and subtotal rows do not split -> whole line lands in description
         if code:
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = code
             ws[f"{COL_DESC}{current_row}"].value = summary
@@ -536,9 +532,8 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
         # Bold subsection headers + subtotal rows (description cell only)
         if is_bold_description_row(raw_line) and not code:
-            desc_cell = ws[f"{COL_DESC}{current_row}"]
-            desc_cell.font = Font(bold=True)
-            
+            ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
+
         current_row += 1
         item_num += 1
 
@@ -573,8 +568,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 # =============================================================================
 # PDF parsing (with subsection headers and per-subsection subtotals injected)
 # =============================================================================
-
-# Accept: description qty $ unit $ extended
 LINE_ITEM_RE = re.compile(
     r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*$'
 )
@@ -586,16 +579,12 @@ MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
 TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
 SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s+Type\s*&\s+Overall\b', re.I)
-
-# Generic subsection headers: anything ending with SIGN PACKAGE / SIGNAGE PACKAGE
 SIGN_PACKAGE_HEADER_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
 
-# Section headings
 SHIPPING_HEADER_RE = re.compile(r'\bSHIPPING\b', re.I)
 INSTALL_HEADER_RE = re.compile(r'\bINSTALL(?:ATION)?\b', re.I)
 PERMIT_HEADER_RE = re.compile(r'\bPERMIT(?:TING)?\b', re.I)
 
-# Header fields
 DATE_RE = re.compile(r'\bDate\s+(\d{1,2}/\d{1,2}/\d{2,4})\b', re.I)
 PROJECT_ID_RE = re.compile(r'\bProject\s+Id\s*:\s*(\S+)\b', re.I)
 PROJECT_DESC_RE = re.compile(r'\bProject\s+Desc\.?\s*:\s*(.+?)\s*(?:Ship\s+Via|$)', re.I)
@@ -622,7 +611,7 @@ def _init_data() -> Dict[str, Any]:
         "sign_types": [],
         "shipping": [],
         "installation": [],
-        "permitting": [],   # NEW (kept for completeness; not currently written to Excel)
+        "permitting": [],
         "totals": {"sub_total": None, "mark_up": None, "total": None}
     }
 
@@ -695,10 +684,6 @@ def _apply_totals_extraction(data: Dict[str, Any], line: str):
         data["totals"]["total"] = _extract_money(line)
 
 def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
-    """
-    Only parse summary rows with prices.
-    Require '$' to avoid component/dimension lines.
-    """
     if not line or not line.strip():
         return None
     if "$" not in line:
@@ -795,20 +780,20 @@ def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
 def _append_sign_row_text_only(data: Dict[str, Any], text: str):
     """
     Add a row that only populates the description column in Excel.
-    We do this by setting sign_type to the full text and leaving qty/unit/ext empty.
+    IMPORTANT: allow truly blank spacer rows (text == "").
     """
-    t = (text or "").strip()
-    if not t:
+    # ✅ allow empty string so we can create a spacer row
+    if text is None:
         return
     data["sign_types"].append({
-        "sign_type": t,
+        "sign_type": str(text),
         "qty": None,
         "unit_price": None,
         "extended_total": None
     })
 
 def _fmt_money(v: float) -> str:
-    return f"{v:,.2f}"
+    return f"{float(v):,.2f}"
 
 def _flush_subsection_subtotals_into_sign_types(
     data: Dict[str, Any],
@@ -817,12 +802,6 @@ def _flush_subsection_subtotals_into_sign_types(
     perm_sub: float,
     add_blank_row_after: bool = False
 ):
-    """
-    Inserts subtotal rows into sign_types BEFORE the next subsection header.
-    Rows are description-only in Excel.
-
-    Guard: does not emit rows when subtotal is effectively zero (abs < SUBTOTAL_EPSILON).
-    """
     def is_effectively_zero(v: float) -> bool:
         return v is None or abs(float(v)) < SUBTOTAL_EPSILON
 
@@ -840,16 +819,14 @@ def _flush_subsection_subtotals_into_sign_types(
         _append_sign_row_text_only(data, f"Permitting Subtotal ${_fmt_money(perm_sub)}")
         emitted_any = True
 
-    # Add a blank spacer row between the last subtotal and the next subsection header
+    # Spacer between subtotals and next subsection header
     if add_blank_row_after and emitted_any:
         _append_sign_row_text_only(data, "")
 
 def _section_from_line(current: str, line: str) -> str:
-    # Totals stop parsing sections
     if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
         return "totals"
 
-    # Headings (broad)
     if SHIPPING_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "shipping"
     if INSTALL_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
@@ -857,7 +834,6 @@ def _section_from_line(current: str, line: str) -> str:
     if PERMIT_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "permitting"
 
-    # Repeating sign table header usually indicates signage table
     if SIGN_TABLE_HEADER_RE.search(line):
         if current not in ("shipping", "installation", "permitting"):
             return "signage"
@@ -869,7 +845,6 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
     data = _init_data()
     section = "other"
 
-    # Track per-subsection totals
     ship_sub = 0.0
     inst_sub = 0.0
     perm_sub = 0.0
@@ -885,16 +860,13 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
         _apply_header_extraction(data, line)
         _apply_totals_extraction(data, line)
 
-        # Subsection header encountered:
-        # Before starting a NEW subsection, inject the previous subsection's subtotals (if any)
         if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
             if last_sign_header:
                 _flush_subsection_subtotals_into_sign_types(
                     data, ship_sub, inst_sub, perm_sub,
-                    add_blank_row_after=False  # <-- spacer before next subsection header
+                    add_blank_row_after=True  # ✅ spacer before next subsection header
                 )
             ship_sub = inst_sub = perm_sub = 0.0
-
 
             hdr = line.strip()
             if hdr and hdr != last_sign_header:
@@ -910,9 +882,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
         if not parsed:
             continue
 
-        ext_val = parsed.get("extended_total")
-        if ext_val is None:
-            ext_val = 0.0
+        ext_val = parsed.get("extended_total") or 0.0
 
         if section == "signage":
             data["sign_types"].append({
@@ -929,7 +899,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
                 "extended_total": parsed["extended_total"],
                 "notes": ""
             })
-            ship_sub += float(ext_val or 0.0)
+            ship_sub += float(ext_val)
         elif section == "installation":
             data["installation"].append({
                 "description": parsed["description"],
@@ -938,7 +908,7 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
                 "extended_total": parsed["extended_total"],
                 "notes": ""
             })
-            inst_sub += float(ext_val or 0.0)
+            inst_sub += float(ext_val)
         elif section == "permitting":
             data["permitting"].append({
                 "description": parsed["description"],
@@ -947,17 +917,16 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
                 "extended_total": parsed["extended_total"],
                 "notes": ""
             })
-            perm_sub += float(ext_val or 0.0)
+            perm_sub += float(ext_val)
 
-    
+    # ✅ EOF flush for final subsection (no spacer at EOF)
     if last_sign_header:
         _flush_subsection_subtotals_into_sign_types(
             data, ship_sub, inst_sub, perm_sub,
             add_blank_row_after=False
-    )
+        )
 
     return data
-
 
 
 def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
@@ -985,7 +954,10 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
 
             if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
                 if last_sign_header:
-                    _flush_subsection_subtotals_into_sign_types(data, ship_sub, inst_sub, perm_sub)
+                    _flush_subsection_subtotals_into_sign_types(
+                        data, ship_sub, inst_sub, perm_sub,
+                        add_blank_row_after=True
+                    )
                 ship_sub = inst_sub = perm_sub = 0.0
 
                 hdr = line.strip()
@@ -1002,9 +974,7 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
             if not parsed:
                 continue
 
-            ext_val = parsed.get("extended_total")
-            if ext_val is None:
-                ext_val = 0.0
+            ext_val = parsed.get("extended_total") or 0.0
 
             if section == "signage":
                 data["sign_types"].append({
@@ -1021,7 +991,7 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                     "extended_total": parsed["extended_total"],
                     "notes": ""
                 })
-                ship_sub += float(ext_val or 0.0)
+                ship_sub += float(ext_val)
             elif section == "installation":
                 data["installation"].append({
                     "description": parsed["description"],
@@ -1030,7 +1000,7 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                     "extended_total": parsed["extended_total"],
                     "notes": ""
                 })
-                inst_sub += float(ext_val or 0.0)
+                inst_sub += float(ext_val)
             elif section == "permitting":
                 data["permitting"].append({
                     "description": parsed["description"],
@@ -1039,10 +1009,14 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                     "extended_total": parsed["extended_total"],
                     "notes": ""
                 })
-                perm_sub += float(ext_val or 0.0)
+                perm_sub += float(ext_val)
 
+    # ✅ EOF flush for final subsection (no spacer at EOF)
     if last_sign_header:
-        _flush_subsection_subtotals_into_sign_types(data, ship_sub, inst_sub, perm_sub)
+        _flush_subsection_subtotals_into_sign_types(
+            data, ship_sub, inst_sub, perm_sub,
+            add_blank_row_after=False
+        )
 
     return data
 
@@ -1103,7 +1077,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
 
         base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
         if not base_url:
-            base_url = "http://localhost:8000"
+            base_url = "https://fastapi-production-37f6.up.railway.app"
 
         download_url = f"{base_url}/download/{output_filename}"
 
