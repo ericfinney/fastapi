@@ -4,20 +4,19 @@ import json
 import logging
 import re
 import time
+import base64
+from io import BytesIO
 from copy import copy
 from typing import Dict, Any, List, Optional, Tuple
 
 from fastapi import FastAPI, Body, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from pydantic import BaseModel
+from pypdf import PdfReader
+
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Protection, Font
-
-from pydantic import BaseModel
-from pypdf import PdfReader
-import base64
-from io import BytesIO
-from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 
@@ -26,58 +25,18 @@ SHEET_NAME = os.environ.get("BOYD_SHEET_NAME", "Proposal")
 OUTPUT_DIR = os.environ.get("BOYD_OUTPUT_DIR", "/tmp/output")
 LOGO_PATH = os.environ.get("BOYD_LOGO_PATH", "assets/logo.png")
 
-# Fallback mode for big PDFs:
 MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
+SUBTOTAL_EPSILON = 0.005  # ignore < half-cent for subsection subtotals
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ✅ FIX: remove stray "f"
 app = FastAPI()
 
-# Treat anything smaller than half a cent as zero (guards rounding noise)
-SUBTOTAL_EPSILON = 0.005
-
-SUBTOTAL_ROW_RE = re.compile(r'^\s*(Shipping|Install|Permitting)\s+Subtotal\s+\$', re.I)
-SIGN_PACKAGE_HEADER_RE_EXCEL = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
-
 
 # =========================================================
-# Cleanup: delete old generated workbooks
-# =========================================================
-def cleanup_old_generated_workbooks(
-    directory: str,
-    older_than_minutes: int = 30,
-    filename_prefix: str = "Boyd_Proposal_",
-    allowed_exts: Tuple[str, ...] = (".xlsx", ".xlsm"),
-) -> None:
-    if not os.path.isdir(directory):
-        return
-    now = time.time()
-    max_age_sec = older_than_minutes * 60
-
-    for fn in os.listdir(directory):
-        fn_lower = fn.lower()
-        if not fn.startswith(filename_prefix):
-            continue
-        if not fn_lower.endswith(tuple(ext.lower() for ext in allowed_exts)):
-            continue
-
-        path = os.path.join(directory, fn)
-        if not os.path.isfile(path):
-            continue
-
-        try:
-            age_sec = now - os.path.getmtime(path)
-            if age_sec > max_age_sec:
-                os.remove(path)
-                logging.info("Deleted old output workbook: %s (age %.1f min)", fn, age_sec / 60.0)
-        except Exception as e:
-            logging.warning("Failed deleting %s: %s", fn, e)
-
-
-# =========================================================
-# Basic helpers
+# Utils
 # =========================================================
 def safe_str(x) -> str:
     return "" if x is None else str(x)
@@ -99,98 +58,50 @@ def round_nearest_dollar(value):
         return None
 
 def join_address_lines(addr_lines: List[str]) -> str:
-    return "\n".join([line for line in addr_lines if line and line.strip()])
+    return "\n".join([line for line in addr_lines if line and str(line).strip()])
 
 def write_cell(ws, cell: str, value):
     ws[cell].value = value
 
 def insert_logo(ws):
     if not os.path.exists(LOGO_PATH):
-        logging.warning("Logo not found at %s; skipping insert.", LOGO_PATH)
         return
     img = XLImage(LOGO_PATH)
     ws.add_image(img, "A1")
 
-def is_bold_description_row(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    return bool(SIGN_PACKAGE_HEADER_RE_EXCEL.search(t) or SUBTOTAL_ROW_RE.search(t))
-
-# Robust sign code token for Alternate detection
-SIGN_CODE_TOKEN_RE = re.compile(r'^\s*([A-Za-z]\.[0-9A-Za-z.]+)\b')
-
-def extract_sign_code(raw: str) -> str:
-    if not raw:
-        return ""
-    m = SIGN_CODE_TOKEN_RE.search(str(raw))
-    return m.group(1).strip() if m else ""
 
 # =========================================================
-# Lock/Unlock helpers
+# Cleanup old outputs
 # =========================================================
-def lock_cell(ws, cell_ref: str):
-    ws[cell_ref].protection = Protection(locked=True)
+def cleanup_old_generated_workbooks(
+    directory: str,
+    older_than_minutes: int = 30,
+    filename_prefix: str = "Boyd_Proposal_",
+    allowed_exts: Tuple[str, ...] = (".xlsx", ".xlsm"),
+) -> None:
+    if not os.path.isdir(directory):
+        return
+    now = time.time()
+    max_age_sec = older_than_minutes * 60
 
-def unlock_cell(ws, cell_ref: str):
-    ws[cell_ref].protection = Protection(locked=False)
-
-def lock_all_cells(ws, max_row: int, max_col: int) -> None:
-    for r in range(1, max_row + 1):
-        for c in range(1, max_col + 1):
-            ws.cell(row=r, column=c).protection = Protection(locked=True)
-
-
-# =========================================================
-# Footer row height capture/restore
-# =========================================================
-def capture_row_heights(ws, start_row: int, end_row: int) -> dict:
-    heights = {}
-    for r in range(start_row, end_row + 1):
-        heights[r] = ws.row_dimensions[r].height
-    return heights
-
-def restore_row_heights(ws, heights: dict, row_offset: int):
-    for original_row, height in heights.items():
-        target_row = original_row + row_offset
-        ws.row_dimensions[target_row].height = height
+    for fn in os.listdir(directory):
+        if not fn.startswith(filename_prefix):
+            continue
+        if not fn.lower().endswith(tuple(ext.lower() for ext in allowed_exts)):
+            continue
+        path = os.path.join(directory, fn)
+        if not os.path.isfile(path):
+            continue
+        try:
+            age_sec = now - os.path.getmtime(path)
+            if age_sec > max_age_sec:
+                os.remove(path)
+        except Exception:
+            pass
 
 
 # =========================================================
-# Sign type + summary split (Excel display only)
-# JSON keeps sign_type EXACTLY as PDF.
-# =========================================================
-TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
-
-def looks_like_sign_code(code: str) -> bool:
-    if not code:
-        return False
-    c = code.strip()
-    if not c or len(c) > 60:
-        return False
-    if not re.match(r"^[A-Za-z0-9]", c):
-        return False
-    if not re.match(r"^[A-Za-z0-9./&_ ,]+$", c):
-        return False
-    return True
-
-def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
-    if not raw:
-        return "", ""
-    s = str(raw).strip()
-    if not s:
-        return "", ""
-    parts = TYPE_DESC_SPLIT_RE.split(s, maxsplit=1)
-    if len(parts) == 2:
-        code = parts[0].strip()
-        summary = parts[1].strip()
-        if looks_like_sign_code(code):
-            return code, summary
-    return "", s
-
-
-# =========================================================
-# Merge shifting helpers
+# Excel row sizing + protection helpers (minimal)
 # =========================================================
 CELL_RE = re.compile(r"^([A-Z]+)(\d+)$")
 
@@ -200,6 +111,13 @@ def shift_cell_ref(cell_ref: str, row_offset: int) -> str:
         return cell_ref
     col, row = m.group(1), int(m.group(2))
     return f"{col}{row + row_offset}"
+
+def save_merged_ranges(ws) -> List[str]:
+    return [str(rng) for rng in ws.merged_cells.ranges]
+
+def unmerge_all(ws, merges: List[str]):
+    for rng in merges:
+        ws.unmerge_cells(rng)
 
 def parse_range(a1_range: str) -> Tuple[str, str]:
     if ":" in a1_range:
@@ -237,17 +155,9 @@ def shift_range_overlap_safe(a1_range: str, footer_start_row: int, row_offset: i
     new_b = apply_shift(b)
     return f"{new_a}:{new_b}" if ":" in a1_range else new_a
 
-def save_merged_ranges(ws) -> List[str]:
-    return [str(rng) for rng in ws.merged_cells.ranges]
-
-def unmerge_all(ws, merges: List[str]):
-    for rng in merges:
-        ws.unmerge_cells(rng)
-
 def restore_merges(ws, merges: List[str], footer_start_row: int, row_offset: int):
     for rng in merges:
-        new_rng = shift_range_overlap_safe(rng, footer_start_row, row_offset)
-        ws.merge_cells(new_rng)
+        ws.merge_cells(shift_range_overlap_safe(rng, footer_start_row, row_offset))
 
 def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
     ws.row_dimensions[dst_row].height = ws.row_dimensions[src_row].height
@@ -262,10 +172,6 @@ def copy_row_style(ws, src_row: int, dst_row: int, max_col: int):
         dst.fill = copy(src.fill)
         dst.font = copy(src.font)
 
-
-# =========================================================
-# Body adjust
-# =========================================================
 def adjust_body_rows_preserve_footer(
     ws,
     sign_count: int,
@@ -297,26 +203,6 @@ def adjust_body_rows_preserve_footer(
     restore_merges(ws, merges, footer_start, diff)
     return diff
 
-
-# =========================================================
-# Totals helpers
-# =========================================================
-def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
-    if not items:
-        return None
-    total = 0.0
-    found = False
-    for it in items:
-        val = safe_num(it.get("extended_total"))
-        if val is not None:
-            total += val
-            found = True
-    return total if found else None
-
-
-# =========================================================
-# Approx row height
-# =========================================================
 def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[str], min_height: float = 15.0):
     CHARS_PER_LINE = 60
     LINE_HEIGHT = 15
@@ -338,22 +224,18 @@ def approximate_autofit_rows(ws, row_start: int, row_end: int, text_cols: List[s
             max_lines = max(max_lines, line_count)
         ws.row_dimensions[r].height = max(min_height, max_lines * LINE_HEIGHT)
 
+def lock_all_cells(ws, max_row: int, max_col: int) -> None:
+    for r in range(1, max_row + 1):
+        for c in range(1, max_col + 1):
+            ws.cell(row=r, column=c).protection = Protection(locked=True)
 
-# =========================================================
-# Selection control
-# =========================================================
+def unlock_cell(ws, cell_ref: str):
+    ws[cell_ref].protection = Protection(locked=False)
+
 def unlock_body_selection(ws, body_row_start: int, body_row_end: int) -> None:
     for r in range(body_row_start, body_row_end + 1):
         for col in ("B", "C", "D", "E"):
             unlock_cell(ws, f"{col}{r}")
-
-    for rng in ws.merged_cells.ranges:
-        min_row, max_row = rng.min_row, rng.max_row
-        min_col, max_col = rng.min_col, rng.max_col
-        rows_intersect = not (max_row < body_row_start or min_row > body_row_end)
-        cols_intersect = not (max_col < 2 or min_col > 5)
-        if rows_intersect and cols_intersect:
-            ws.cell(row=min_row, column=min_col).protection = Protection(locked=False)
 
 def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: int) -> None:
     max_row = max(ws.max_row, body_row_end + 5)
@@ -364,283 +246,125 @@ def apply_sheet_protection_for_selection(ws, body_row_start: int, body_row_end: 
 
 
 # =========================================================
-# FastAPI endpoints
+# Parsing helpers
 # =========================================================
-@app.get("/health")
-def health_check():
-    return {
-        "status": "ok",
-        "template_exists": os.path.exists(TEMPLATE_PATH),
-        "template_path": TEMPLATE_PATH,
-        "sheet_name": SHEET_NAME,
-        "logo_exists": os.path.exists(LOGO_PATH),
-        "logo_path": LOGO_PATH
-    }
+# Strict sign code: Letter '.' Digit ...  (prevents "BLDG." from ever becoming a code)
+SIGN_CODE_STRICT_RE = re.compile(r'^\s*([A-Za-z]\.(?:\d+[A-Za-z0-9]*)(?:\.\d+[A-Za-z0-9]*)*)\b')
+
+TYPE_DESC_SPLIT_RE = re.compile(r"\s*[-–—]\s*", flags=re.UNICODE)
+
+def looks_like_sign_code(code: str) -> bool:
+    if not code:
+        return False
+    c = code.strip()
+    if not c or len(c) > 60:
+        return False
+    if not re.match(r"^[A-Za-z0-9]", c):
+        return False
+    if not re.match(r"^[A-Za-z0-9./&_ ,]+$", c):
+        return False
+    return True
+
+def extract_sign_code_strict(raw: str) -> str:
+    if not raw:
+        return ""
+    m = SIGN_CODE_STRICT_RE.search(str(raw))
+    return m.group(1).strip() if m else ""
+
+def split_sign_type_and_summary(raw: str) -> Tuple[str, str]:
+    if not raw:
+        return "", ""
+    s = str(raw).strip()
+    if not s:
+        return "", ""
+    parts = TYPE_DESC_SPLIT_RE.split(s, maxsplit=1)
+    if len(parts) == 2:
+        code = parts[0].strip()
+        summary = parts[1].strip()
+        # allow codes like "E1" too (some PDFs omit dot)
+        if looks_like_sign_code(code):
+            return code, summary
+    return "", s
+
+def sum_extended(items: Optional[List[Dict[str, Any]]]) -> Optional[float]:
+    if not items:
+        return None
+    total = 0.0
+    found = False
+    for it in items:
+        val = safe_num(it.get("extended_total"))
+        if val is not None:
+            total += val
+            found = True
+    return total if found else None
+
+def _fmt_money(v: float) -> str:
+    return f"{float(v):,.2f}"
+
+def _append_sign_row_text_only(data: Dict[str, Any], text: str):
+    # allow empty "" to create spacer rows
+    if text is None:
+        return
+    data["sign_types"].append({
+        "sign_type": str(text),
+        "qty": None,
+        "unit_price": None,
+        "extended_total": None
+    })
+
+def _flush_subsection_subtotals_into_sign_types(
+    data: Dict[str, Any],
+    ship_sub: float,
+    inst_sub: float,
+    perm_sub: float,
+    add_blank_row_after: bool = False
+):
+    def is_effectively_zero(v: float) -> bool:
+        return v is None or abs(float(v)) < SUBTOTAL_EPSILON
+
+    emitted_any = False
+
+    if not is_effectively_zero(ship_sub):
+        _append_sign_row_text_only(data, f"Shipping Subtotal ${_fmt_money(ship_sub)}")
+        emitted_any = True
+
+    if not is_effectively_zero(inst_sub):
+        _append_sign_row_text_only(data, f"Install Subtotal ${_fmt_money(inst_sub)}")
+        emitted_any = True
+
+    if not is_effectively_zero(perm_sub):
+        _append_sign_row_text_only(data, f"Permitting Subtotal ${_fmt_money(perm_sub)}")
+        emitted_any = True
+
+    if add_blank_row_after and emitted_any:
+        _append_sign_row_text_only(data, "")
 
 
-@app.post("/generate_proposal")
-def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
-    if not payload or "payload" not in payload:
-        raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
+# =========================================================
+# Identify bold rows in Excel (subsection headers + subtotal rows)
+# =========================================================
+SUBTOTAL_ROW_RE = re.compile(r'^\s*(Shipping|Install|Permitting)\s+Subtotal\s+\$', re.I)
+SIGN_PACKAGE_HEADER_RE_EXCEL = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
 
-    cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
-
-    try:
-        estimate_data = json.loads(payload["payload"])
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON string in 'payload': {str(e)}")
-
-    if not isinstance(estimate_data, dict) or not estimate_data:
-        raise HTTPException(status_code=400, detail="Decoded 'payload' must be a non-empty JSON object.")
-
-    if not os.path.exists(TEMPLATE_PATH):
-        raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
-
-    try:
-        file_id = uuid.uuid4().hex
-        out_name = f"Boyd_Proposal_{file_id}.xlsx"
-        out_path = os.path.join(OUTPUT_DIR, out_name)
-        generate_excel_from_data(estimate_data, out_path)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logging.exception("Proposal generation failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-    base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
-    if not base_url:
-        base_url = "http://localhost:8000"
-
-    download_url = f"{base_url}/download/{out_name}"
-    return JSONResponse({"download_url": download_url, "filename": out_name})
+def is_bold_description_row(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    # Subsection headers end with SIGN PACKAGE (your examples)
+    if SIGN_PACKAGE_HEADER_RE_EXCEL.search(t):
+        return True
+    # Our injected subtotal rows
+    if SUBTOTAL_ROW_RE.search(t):
+        return True
+    return False
 
 
-@app.get("/download/{filename}")
-def download_file(filename: str):
-    file_path = os.path.join(OUTPUT_DIR, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="File not found")
-
-    return FileResponse(
-        file_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=filename
-    )
-
-
-# =============================================================================
-# Web interface & request model
-# =============================================================================
-class GenerateFromPdfRequest(BaseModel):
-    pdf_base64: str
-    filename: str = "estimate.pdf"
-
-
-@app.get("/", response_class=HTMLResponse)
-async def web_interface():
-    html_path = Path(__file__).parent / "templates" / "upload.html"
-    if not html_path.exists():
-        return """<html><body><h1>Boyd Proposal Generator</h1><p>Use POST /generate_proposal_from_pdf</p></body></html>"""
-    with open(html_path) as f:
-        return f.read()
-
-
-# =============================================================================
-# Excel generation aligned with JSON schema
-# =============================================================================
-def generate_excel_from_data(estimate_data: dict, output_path: str):
-    if not os.path.exists(TEMPLATE_PATH):
-        raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
-
-    wb = load_workbook(TEMPLATE_PATH)
-    if SHEET_NAME not in wb.sheetnames:
-        raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
-    ws = wb[SHEET_NAME]
-
-    ws.protection.sheet = False
-    insert_logo(ws)
-
-    FOOTER_HEIGHT_START = 48
-    FOOTER_HEIGHT_END = 120
-    footer_row_heights = capture_row_heights(ws, FOOTER_HEIGHT_START, FOOTER_HEIGHT_END)
-
-    write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
-    write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
-    write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
-    write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
-    write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
-
-    sold_to = estimate_data.get("sold_to", {}) or {}
-    ship_to = estimate_data.get("ship_to", {}) or {}
-
-    write_cell(ws, "D11", safe_str(sold_to.get("name")))
-    write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
-    sold_csz = " ".join([p for p in [
-        safe_str(sold_to.get("city")),
-        safe_str(sold_to.get("state")),
-        safe_str(sold_to.get("zip"))
-    ] if p.strip()])
-    write_cell(ws, "D16", sold_csz)
-    write_cell(ws, "D17", safe_str(sold_to.get("phone")))
-
-    write_cell(ws, "C11", safe_str(ship_to.get("name")))
-    write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
-    ship_csz = " ".join([p for p in [
-        safe_str(ship_to.get("city")),
-        safe_str(ship_to.get("state")),
-        safe_str(ship_to.get("zip"))
-    ] if p.strip()])
-    write_cell(ws, "C16", ship_csz)
-    write_cell(ws, "C17", safe_str(ship_to.get("phone")))
-
-    sign_types = estimate_data.get("sign_types", []) or []
-    sign_count = len(sign_types)
-
-    BODY_START = 28
-    BODY_END = 47
-    EXTRA_BLANK = 3
-
-    footer_row_offset = adjust_body_rows_preserve_footer(
-        ws,
-        sign_count=sign_count,
-        body_start=BODY_START,
-        body_end=BODY_END,
-        extra_blank_rows=EXTRA_BLANK
-    )
-
-    total_body_rows_needed = sign_count + EXTRA_BLANK
-    body_last_row = BODY_START + total_body_rows_needed - 1
-
-    # ---------------- Write sign lines ----------------
-    COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
-    current_row = BODY_START
-    item_num = 1
-
-    # Track only the immediately previous priced PRIMARY sign code (for consecutive Alternates)
-    prev_priced_code = None
-    prev_row_was_priced_primary = False
-
-    for sign in sign_types:
-        ws[f"{COL_ITEM}{current_row}"].value = item_num
-
-        raw_type = safe_str(sign.get("sign_type"))
-        qty_val = safe_num(sign.get("qty"))
-        unit_val = safe_num(sign.get("unit_price"))
-
-        is_priced_row = (qty_val is not None and unit_val is not None)
-
-        # Special rows (subsection header, subtotal rows, spacer rows) are description-only
-        is_header_or_subtotal = is_bold_description_row(raw_type)
-        is_spacer = (raw_type.strip() == "")
-        is_special = is_header_or_subtotal or is_spacer or (not is_priced_row and unit_val is None)
-
-        # Any special/non-priced row breaks alternate chaining
-        if is_special or (not is_priced_row):
-            prev_priced_code = None
-            prev_row_was_priced_primary = False
-
-        # Determine sign code + description for display
-        clean_type, summary = split_sign_type_and_summary(raw_type)
-        code_key = extract_sign_code(raw_type)
-
-        # Fallback if regex failed but split returned something code-like
-        if not code_key and looks_like_sign_code(clean_type):
-            code_key = clean_type
-
-        desc_summary = summary.strip() if summary else safe_str(sign.get("description")).strip()
-        if not desc_summary:
-            desc_summary = raw_type.strip()
-
-        # If this is a special row, write description only (bold if header/subtotal)
-        if is_special and not is_priced_row:
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-            ws[f"{COL_QTY}{current_row}"].value = None
-            ws[f"{COL_UNIT}{current_row}"].value = None
-            ws[f"{COL_TOTAL}{current_row}"].value = None
-            ws[f"{COL_DESC}{current_row}"].value = raw_type
-
-            if is_header_or_subtotal:
-                ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
-
-            current_row += 1
-            item_num += 1
-            continue
-
-        # Alternate ONLY when the previous row was a priced primary with the same code_key
-        is_alternate = (
-            is_priced_row
-            and bool(code_key)
-            and prev_row_was_priced_primary
-            and prev_priced_code == code_key
-        )
-
-        if is_alternate:
-            # Alternate formatting: description + unit only
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
-            ws[f"{COL_QTY}{current_row}"].value = None
-            ws[f"{COL_TOTAL}{current_row}"].value = None
-            ws[f"{COL_DESC}{current_row}"].value = f"Alternate {desc_summary}".strip()
-            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
-
-            # Alternates do not count as "primary" for chaining
-            prev_row_was_priced_primary = False
-        else:
-            # Primary row
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code_key if code_key else clean_type
-            ws[f"{COL_QTY}{current_row}"].value = qty_val
-            ws[f"{COL_DESC}{current_row}"].value = desc_summary
-            ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
-
-            # Total formula only for primary rows
-            ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
-
-            # Update previous primary tracking
-            prev_priced_code = code_key
-            prev_row_was_priced_primary = True
-
-        current_row += 1
-        item_num += 1
-
-
-
-    # --- Totals ---
-    totals = estimate_data.get("totals", {}) or {}
-    grand_total = safe_num(totals.get("total"))
-
-    shipping_total = sum_extended(estimate_data.get("shipping"))
-    install_total = sum_extended(estimate_data.get("installation"))
-
-    SUBTOTAL_CELL = "F48"
-    SHIPPING_CELL = "F49"
-    INSTALL_CELL = "F53"
-    TOTAL_CELL = "F54"
-
-    subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
-    body_sum_range = f"F{BODY_START}:F{body_last_row}"
-    ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
-
-    write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_total if shipping_total is not None else 0.00)
-    write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_total if install_total is not None else 0.00)
-
-    if grand_total is not None:
-        write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
-
-    # --- Layout / protection ---
-    last_used_row = ws.max_row
-    approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
-    restore_row_heights(ws, footer_row_heights, footer_row_offset)
-    apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
-
-    wb.save(output_path)
-
-
-# =============================================================================
-# PDF parsing (with subsection headers and per-subsection subtotals injected)
-# =============================================================================
+# =========================================================
+# PDF parsing
+# =========================================================
 LINE_ITEM_RE = re.compile(
     r'^\s*(.+?)\s+(\d+(?:\.\d+)?)\s+\$?\s*([\d,]+(?:\.\d+)?)\s*\$?\s*([\d,]+(?:\.\d+)?)\s*$'
 )
-
 MONEY_RE = re.compile(r'\$?\s*([\d,]+(?:\.\d+)?)')
 
 SUBTOTAL_RE = re.compile(r'\bSUB[- ]?TOTAL\b', re.I)
@@ -648,7 +372,6 @@ MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
 TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
 SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s+Type\s*&\s+Overall\b', re.I)
-SIGN_PACKAGE_HEADER_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
 
 SHIPPING_HEADER_RE = re.compile(r'\bSHIPPING\b', re.I)
 INSTALL_HEADER_RE = re.compile(r'\bINSTALL(?:ATION)?\b', re.I)
@@ -660,12 +383,13 @@ PROJECT_DESC_RE = re.compile(r'\bProject\s+Desc\.?\s*:\s*(.+?)\s*(?:Ship\s+Via|$
 
 SALESPERSON_RE = re.compile(r'\bSalesperson\s*:\s*(.+)$', re.I)
 SALES_REP_RE = re.compile(r'\bSales\s+Rep\s*:\s*(.+)$', re.I)
-
 PM_RE = re.compile(r'\bProject\s+Manager\s*:\s*(.+)$', re.I)
 PE_RE = re.compile(r'\bProject\s+Engineer\s*:\s*(.+)$', re.I)
 
 CITY_STATE_ZIP_RE = re.compile(r'([A-Za-z .\'&/-]+)\s*,\s*([A-Z]{2})\s*(\d{5})(?:-\d{4})?')
 
+# Subsection headers: anything ending with "SIGN PACKAGE"
+SUBSECTION_HEADER_RE = re.compile(r'\bSIGN\s+PACKAGE\b\s*$', re.I)
 
 def _init_data() -> Dict[str, Any]:
     return {
@@ -745,10 +469,8 @@ def _apply_header_extraction(data: Dict[str, Any], line: str):
 def _apply_totals_extraction(data: Dict[str, Any], line: str):
     if data["totals"]["sub_total"] is None and SUBTOTAL_RE.search(line):
         data["totals"]["sub_total"] = _extract_money(line)
-
     if data["totals"]["mark_up"] is None and MARKUP_RE.search(line):
         data["totals"]["mark_up"] = _extract_money(line)
-
     if data["totals"]["total"] is None and TOTAL_RE.search(line):
         data["totals"]["total"] = _extract_money(line)
 
@@ -757,7 +479,6 @@ def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
         return None
     if "$" not in line:
         return None
-
     m = LINE_ITEM_RE.match(line)
     if not m:
         return None
@@ -771,10 +492,12 @@ def _parse_line_item(line: str) -> Optional[Dict[str, Any]]:
     if qty is not None and abs(qty - int(qty)) < 1e-9:
         qty = int(qty)
 
-    unit_price = safe_num(unit_raw)
-    extended_total = safe_num(ext_raw)
-
-    return {"description": description, "qty": qty, "unit_price": unit_price, "extended_total": extended_total}
+    return {
+        "description": description,
+        "qty": qty,
+        "unit_price": safe_num(unit_raw),
+        "extended_total": safe_num(ext_raw),
+    }
 
 def _split_two_columns_by_street_numbers(line: str) -> Tuple[str, str]:
     if not line:
@@ -846,101 +569,48 @@ def _apply_sold_ship_extraction(data: Dict[str, Any], lines: List[str]):
                 data["sold_to"]["phone"] = phone
             break
 
-def _append_sign_row_text_only(data: Dict[str, Any], text: str):
-    """
-    Add a row that only populates the description column in Excel.
-    IMPORTANT: allow truly blank spacer rows (text == "").
-    """
-    # ✅ allow empty string so we can create a spacer row
-    if text is None:
-        return
-    data["sign_types"].append({
-        "sign_type": str(text),
-        "qty": None,
-        "unit_price": None,
-        "extended_total": None
-    })
-
-def _fmt_money(v: float) -> str:
-    return f"{float(v):,.2f}"
-
-def _flush_subsection_subtotals_into_sign_types(
-    data: Dict[str, Any],
-    ship_sub: float,
-    inst_sub: float,
-    perm_sub: float,
-    add_blank_row_after: bool = False
-):
-    def is_effectively_zero(v: float) -> bool:
-        return v is None or abs(float(v)) < SUBTOTAL_EPSILON
-
-    emitted_any = False
-
-    if not is_effectively_zero(ship_sub):
-        _append_sign_row_text_only(data, f"Shipping Subtotal ${_fmt_money(ship_sub)}")
-        emitted_any = True
-
-    if not is_effectively_zero(inst_sub):
-        _append_sign_row_text_only(data, f"Install Subtotal ${_fmt_money(inst_sub)}")
-        emitted_any = True
-
-    if not is_effectively_zero(perm_sub):
-        _append_sign_row_text_only(data, f"Permitting Subtotal ${_fmt_money(perm_sub)}")
-        emitted_any = True
-
-    # Spacer between subtotals and next subsection header
-    if add_blank_row_after and emitted_any:
-        _append_sign_row_text_only(data, "")
-
 def _section_from_line(current: str, line: str) -> str:
     if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
         return "totals"
-
     if SHIPPING_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "shipping"
     if INSTALL_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "installation"
     if PERMIT_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "permitting"
-
     if SIGN_TABLE_HEADER_RE.search(line):
         if current not in ("shipping", "installation", "permitting"):
             return "signage"
-
     return current
-
 
 def parse_boyd_estimate_from_text(text: str) -> dict:
     data = _init_data()
-    section = "other"
-
-    ship_sub = 0.0
-    inst_sub = 0.0
-    perm_sub = 0.0
-
-    last_sign_header = ""
-
     lines = [line for line in (text or "").split("\n")]
     _apply_sold_ship_extraction(data, lines)
 
+    section = "other"
+    ship_sub = 0.0
+    inst_sub = 0.0
+    perm_sub = 0.0
+    last_subsection_header = ""
+
     for raw in lines:
         line = raw.strip("\r")
-
         _apply_header_extraction(data, line)
         _apply_totals_extraction(data, line)
 
-        if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
-            if last_sign_header:
+        # Detect subsection header (description-only row)
+        if SUBSECTION_HEADER_RE.search(line.strip()):
+            if last_subsection_header:
                 _flush_subsection_subtotals_into_sign_types(
-                    data, ship_sub, inst_sub, perm_sub,
-                    add_blank_row_after=True  # ✅ spacer before next subsection header
+                    data, ship_sub, inst_sub, perm_sub, add_blank_row_after=True
                 )
             ship_sub = inst_sub = perm_sub = 0.0
 
             hdr = line.strip()
-            if hdr and hdr != last_sign_header:
+            if hdr and hdr != last_subsection_header:
                 _append_sign_row_text_only(data, hdr)
-                last_sign_header = hdr
+                last_subsection_header = hdr
 
             section = "signage"
             continue
@@ -955,58 +625,36 @@ def parse_boyd_estimate_from_text(text: str) -> dict:
 
         if section == "signage":
             data["sign_types"].append({
-                "sign_type": parsed["description"],
+                "sign_type": parsed["description"],   # keep exactly as PDF line
                 "qty": parsed["qty"],
                 "unit_price": parsed["unit_price"],
                 "extended_total": parsed["extended_total"],
             })
         elif section == "shipping":
-            data["shipping"].append({
-                "description": parsed["description"],
-                "qty": parsed["qty"],
-                "unit_price": parsed["unit_price"],
-                "extended_total": parsed["extended_total"],
-                "notes": ""
-            })
+            data["shipping"].append({**parsed, "notes": ""})
             ship_sub += float(ext_val)
         elif section == "installation":
-            data["installation"].append({
-                "description": parsed["description"],
-                "qty": parsed["qty"],
-                "unit_price": parsed["unit_price"],
-                "extended_total": parsed["extended_total"],
-                "notes": ""
-            })
+            data["installation"].append({**parsed, "notes": ""})
             inst_sub += float(ext_val)
         elif section == "permitting":
-            data["permitting"].append({
-                "description": parsed["description"],
-                "qty": parsed["qty"],
-                "unit_price": parsed["unit_price"],
-                "extended_total": parsed["extended_total"],
-                "notes": ""
-            })
+            data["permitting"].append({**parsed, "notes": ""})
             perm_sub += float(ext_val)
 
-    # ✅ EOF flush for final subsection (no spacer at EOF)
-    if last_sign_header:
+    # EOF flush for final subsection
+    if last_subsection_header:
         _flush_subsection_subtotals_into_sign_types(
-            data, ship_sub, inst_sub, perm_sub,
-            add_blank_row_after=False
+            data, ship_sub, inst_sub, perm_sub, add_blank_row_after=False
         )
 
     return data
 
-
 def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
     data = _init_data()
     section = "other"
-
     ship_sub = 0.0
     inst_sub = 0.0
     perm_sub = 0.0
-
-    last_sign_header = ""
+    last_subsection_header = ""
 
     for page_index, page in enumerate(reader.pages):
         page_text = page.extract_text() or ""
@@ -1017,22 +665,20 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
 
         for raw in page_lines:
             line = raw.strip("\r")
-
             _apply_header_extraction(data, line)
             _apply_totals_extraction(data, line)
 
-            if SIGN_PACKAGE_HEADER_RE.search(line.strip()):
-                if last_sign_header:
+            if SUBSECTION_HEADER_RE.search(line.strip()):
+                if last_subsection_header:
                     _flush_subsection_subtotals_into_sign_types(
-                        data, ship_sub, inst_sub, perm_sub,
-                        add_blank_row_after=True
+                        data, ship_sub, inst_sub, perm_sub, add_blank_row_after=True
                     )
                 ship_sub = inst_sub = perm_sub = 0.0
 
                 hdr = line.strip()
-                if hdr and hdr != last_sign_header:
+                if hdr and hdr != last_subsection_header:
                     _append_sign_row_text_only(data, hdr)
-                    last_sign_header = hdr
+                    last_subsection_header = hdr
 
                 section = "signage"
                 continue
@@ -1053,115 +699,287 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
                     "extended_total": parsed["extended_total"],
                 })
             elif section == "shipping":
-                data["shipping"].append({
-                    "description": parsed["description"],
-                    "qty": parsed["qty"],
-                    "unit_price": parsed["unit_price"],
-                    "extended_total": parsed["extended_total"],
-                    "notes": ""
-                })
+                data["shipping"].append({**parsed, "notes": ""})
                 ship_sub += float(ext_val)
             elif section == "installation":
-                data["installation"].append({
-                    "description": parsed["description"],
-                    "qty": parsed["qty"],
-                    "unit_price": parsed["unit_price"],
-                    "extended_total": parsed["extended_total"],
-                    "notes": ""
-                })
+                data["installation"].append({**parsed, "notes": ""})
                 inst_sub += float(ext_val)
             elif section == "permitting":
-                data["permitting"].append({
-                    "description": parsed["description"],
-                    "qty": parsed["qty"],
-                    "unit_price": parsed["unit_price"],
-                    "extended_total": parsed["extended_total"],
-                    "notes": ""
-                })
+                data["permitting"].append({**parsed, "notes": ""})
                 perm_sub += float(ext_val)
 
-    # ✅ EOF flush for final subsection (no spacer at EOF)
-    if last_sign_header:
+    if last_subsection_header:
         _flush_subsection_subtotals_into_sign_types(
-            data, ship_sub, inst_sub, perm_sub,
-            add_blank_row_after=False
+            data, ship_sub, inst_sub, perm_sub, add_blank_row_after=False
         )
 
     return data
 
 
-# =============================================================================
-# PDF upload endpoint
-# =============================================================================
+# =========================================================
+# Excel generation (includes corrected Alternate logic)
+# =========================================================
+def generate_excel_from_data(estimate_data: dict, output_path: str):
+    if not os.path.exists(TEMPLATE_PATH):
+        raise HTTPException(status_code=500, detail=f"Template not found at {TEMPLATE_PATH}")
+
+    wb = load_workbook(TEMPLATE_PATH)
+    if SHEET_NAME not in wb.sheetnames:
+        raise HTTPException(status_code=500, detail=f"Sheet '{SHEET_NAME}' not found in workbook.")
+    ws = wb[SHEET_NAME]
+
+    ws.protection.sheet = False
+    insert_logo(ws)
+
+    write_cell(ws, "E5", safe_str(estimate_data.get("estimate_date")))
+    write_cell(ws, "D8", safe_str(estimate_data.get("project_id")))
+    write_cell(ws, "C22", safe_str(estimate_data.get("salesperson")))
+    write_cell(ws, "C23", safe_str(estimate_data.get("project_manager")))
+    write_cell(ws, "C25", safe_str(estimate_data.get("project_description")))
+
+    sold_to = estimate_data.get("sold_to", {}) or {}
+    ship_to = estimate_data.get("ship_to", {}) or {}
+
+    write_cell(ws, "D11", safe_str(sold_to.get("name")))
+    write_cell(ws, "D13", join_address_lines(sold_to.get("address_lines") or []))
+    sold_csz = " ".join([p for p in [
+        safe_str(sold_to.get("city")),
+        safe_str(sold_to.get("state")),
+        safe_str(sold_to.get("zip"))
+    ] if p.strip()])
+    write_cell(ws, "D16", sold_csz)
+    write_cell(ws, "D17", safe_str(sold_to.get("phone")))
+
+    write_cell(ws, "C11", safe_str(ship_to.get("name")))
+    write_cell(ws, "C13", join_address_lines(ship_to.get("address_lines") or []))
+    ship_csz = " ".join([p for p in [
+        safe_str(ship_to.get("city")),
+        safe_str(ship_to.get("state")),
+        safe_str(ship_to.get("zip"))
+    ] if p.strip()])
+    write_cell(ws, "C16", ship_csz)
+    write_cell(ws, "C17", safe_str(ship_to.get("phone")))
+
+    sign_types = estimate_data.get("sign_types", []) or []
+    sign_count = len(sign_types)
+
+    BODY_START = 28
+    BODY_END = 47
+    EXTRA_BLANK = 3
+
+    footer_row_offset = adjust_body_rows_preserve_footer(
+        ws,
+        sign_count=sign_count,
+        body_start=BODY_START,
+        body_end=BODY_END,
+        extra_blank_rows=EXTRA_BLANK
+    )
+
+    total_body_rows_needed = sign_count + EXTRA_BLANK
+    body_last_row = BODY_START + total_body_rows_needed - 1
+
+    COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
+    current_row = BODY_START
+    item_num = 1
+
+    # Correct Alternate logic: ONLY consecutive duplicates of the same sign code,
+    # and only when both rows are priced.
+    prev_priced_primary_code = None
+    prev_row_was_priced_primary = False
+
+    for sign in sign_types:
+        raw_line = safe_str(sign.get("sign_type"))
+        qty_val = safe_num(sign.get("qty"))
+        unit_val = safe_num(sign.get("unit_price"))
+
+        unit_cell_val = round_nearest_dollar(unit_val) if unit_val is not None else None
+        is_priced_row = (qty_val is not None and unit_cell_val is not None)
+
+        is_header_or_subtotal = is_bold_description_row(raw_line)
+        is_spacer = (raw_line.strip() == "")
+        is_special = is_header_or_subtotal or is_spacer or (not is_priced_row)
+
+        ws[f"{COL_ITEM}{current_row}"].value = item_num
+
+        # Special/non-priced rows: description-only
+        if is_special and not is_priced_row:
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
+            ws[f"{COL_QTY}{current_row}"].value = None
+            ws[f"{COL_UNIT}{current_row}"].value = None
+            ws[f"{COL_TOTAL}{current_row}"].value = None
+            ws[f"{COL_DESC}{current_row}"].value = raw_line
+
+            if is_header_or_subtotal:
+                ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
+
+            # reset alternate chaining
+            prev_priced_primary_code = None
+            prev_row_was_priced_primary = False
+
+            current_row += 1
+            item_num += 1
+            continue
+
+        # Determine code + description
+        split_code, split_desc = split_sign_type_and_summary(raw_line)
+        code_key = extract_sign_code_strict(raw_line)  # STRICT (won't match BLDG.)
+        if not code_key:
+            # fallback to split_code (handles "E1 - ..." cases)
+            code_key = split_code.strip() if split_code else ""
+
+        # Description for Excel C
+        desc_summary = split_desc.strip() if split_desc else raw_line.strip()
+
+        # Alternate ONLY when previous row was a priced PRIMARY with same code
+        is_alternate = (
+            is_priced_row
+            and bool(code_key)
+            and prev_row_was_priced_primary
+            and prev_priced_primary_code == code_key
+        )
+
+        if is_alternate:
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
+            ws[f"{COL_QTY}{current_row}"].value = None
+            ws[f"{COL_TOTAL}{current_row}"].value = None
+            ws[f"{COL_DESC}{current_row}"].value = f"Alternate {desc_summary}".strip()
+            ws[f"{COL_UNIT}{current_row}"].value = unit_cell_val
+
+            # alternates do not become new primaries
+            prev_row_was_priced_primary = False
+        else:
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code_key if code_key else (split_code or None)
+            ws[f"{COL_QTY}{current_row}"].value = qty_val
+            ws[f"{COL_DESC}{current_row}"].value = desc_summary
+            ws[f"{COL_UNIT}{current_row}"].value = unit_cell_val
+            ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
+
+            prev_priced_primary_code = code_key if code_key else None
+            prev_row_was_priced_primary = bool(prev_priced_primary_code)
+
+        current_row += 1
+        item_num += 1
+
+    # Totals
+    totals = estimate_data.get("totals", {}) or {}
+    grand_total = safe_num(totals.get("total"))
+
+    shipping_total = sum_extended(estimate_data.get("shipping"))
+    install_total = sum_extended(estimate_data.get("installation"))
+
+    SUBTOTAL_CELL = "F48"
+    SHIPPING_CELL = "F49"
+    INSTALL_CELL = "F53"
+    TOTAL_CELL = "F54"
+
+    subtotal_cell_ref = shift_cell_ref(SUBTOTAL_CELL, footer_row_offset)
+    body_sum_range = f"F{BODY_START}:F{body_last_row}"
+    ws[subtotal_cell_ref].value = f"=SUM({body_sum_range})"
+
+    write_cell(ws, shift_cell_ref(SHIPPING_CELL, footer_row_offset), shipping_total if shipping_total is not None else 0.00)
+    write_cell(ws, shift_cell_ref(INSTALL_CELL, footer_row_offset), install_total if install_total is not None else 0.00)
+    if grand_total is not None:
+        write_cell(ws, shift_cell_ref(TOTAL_CELL, footer_row_offset), grand_total)
+
+    last_used_row = ws.max_row
+    approximate_autofit_rows(ws, row_start=27, row_end=last_used_row, text_cols=["C"], min_height=15.0)
+    apply_sheet_protection_for_selection(ws, body_row_start=BODY_START, body_row_end=body_last_row)
+
+    wb.save(output_path)
+
+
+# =========================================================
+# FastAPI endpoints
+# =========================================================
+class GenerateFromPdfRequest(BaseModel):
+    pdf_base64: str
+    filename: str = "estimate.pdf"
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+@app.post("/generate_proposal")
+def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
+    if not payload or "payload" not in payload:
+        raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
+
+    cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
+
+    try:
+        estimate_data = json.loads(payload["payload"])
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON string in 'payload': {str(e)}")
+
+    file_id = uuid.uuid4().hex
+    out_name = f"Boyd_Proposal_{file_id}.xlsx"
+    out_path = os.path.join(OUTPUT_DIR, out_name)
+    generate_excel_from_data(estimate_data, out_path)
+
+    base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "http://localhost:8000"
+    download_url = f"{base_url}/download/{out_name}"
+    return JSONResponse({"download_url": download_url, "filename": out_name})
+
+@app.get("/download/{filename}")
+def download_file(filename: str):
+    file_path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(
+        file_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=filename
+    )
+
+@app.get("/", response_class=HTMLResponse)
+async def web_interface():
+    return "<html><body><h3>Use POST /generate_proposal_from_pdf</h3></body></html>"
+
 @app.post("/generate_proposal_from_pdf")
 async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
     try:
-        logging.info("Processing PDF: %s", request.filename)
-
         pdf_bytes = base64.b64decode(request.pdf_base64)
-        pdf_file = BytesIO(pdf_bytes)
-        reader = PdfReader(pdf_file)
-
+        reader = PdfReader(BytesIO(pdf_bytes))
         num_pages = len(reader.pages)
-        logging.info("PDF pages: %d", num_pages)
 
-        use_streaming = num_pages >= MAX_PDF_PAGES_STREAMING
-        estimate_data = None
-
-        if use_streaming:
-            logging.info("Using streaming parser (page-by-page) due to page count.")
+        # Streaming fallback for large PDFs
+        if num_pages >= MAX_PDF_PAGES_STREAMING:
             estimate_data = parse_boyd_estimate_streaming(reader)
         else:
             text_parts = []
             total_chars = 0
-            for page in reader.pages:
-                t = page.extract_text() or ""
+            estimate_data = None
+            for p in reader.pages:
+                t = p.extract_text() or ""
                 total_chars += len(t)
                 text_parts.append(t)
                 if total_chars > MAX_EXTRACTED_TEXT_CHARS:
-                    logging.info("Extracted text exceeds %d chars; switching to streaming fallback.", MAX_EXTRACTED_TEXT_CHARS)
                     estimate_data = parse_boyd_estimate_streaming(reader)
                     break
-
             if estimate_data is None:
-                text = "\n".join(text_parts) + "\n"
-                estimate_data = parse_boyd_estimate_from_text(text)
+                estimate_data = parse_boyd_estimate_from_text("\n".join(text_parts) + "\n")
 
-        items_count = len(estimate_data.get("sign_types", []))
-        logging.info("Parsed sign line items (including subsection headers and subtotals): %d", items_count)
+        if len(estimate_data.get("sign_types", [])) == 0:
+            raise HTTPException(status_code=400, detail="No sign line items found in PDF.")
 
-        if items_count == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="No sign line items found in PDF (could not detect sign section or parse price rows)."
-            )
+        cleanup_old_generated_workbooks(OUTPUT_DIR, older_than_minutes=30)
 
-        cleanup_old_generated_workbooks(OUTPUT_DIR)
+        out_name = f"Boyd_Proposal_{uuid.uuid4().hex}.xlsx"
+        out_path = os.path.join(OUTPUT_DIR, out_name)
+        generate_excel_from_data(estimate_data, out_path)
 
-        unique_id = uuid.uuid4().hex
-        output_filename = f"Boyd_Proposal_{unique_id}.xlsx"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-
-        generate_excel_from_data(estimate_data, output_path)
-
-        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
-        if not base_url:
-            base_url = "https://fastapi-production-37f6.up.railway.app"
-
-        download_url = f"{base_url}/download/{output_filename}"
+        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "http://localhost:8000"
+        download_url = f"{base_url}/download/{out_name}"
 
         return {
             "status": "success",
-            "filename": output_filename,
+            "filename": out_name,
             "download_url": download_url,
-            "items_count": items_count,
-            "project_id": estimate_data.get("project_id", ""),
-            "total": estimate_data.get("totals", {}).get("total", None),
-            "used_streaming_fallback": bool(use_streaming)
+            "items_count": len(estimate_data.get("sign_types", [])),
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logging.error("Error processing PDF: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+        logging.exception("Error processing PDF")
+        raise HTTPException(status_code=500, detail=str(e))
