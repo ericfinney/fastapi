@@ -503,7 +503,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     total_body_rows_needed = sign_count + EXTRA_BLANK
     body_last_row = BODY_START + total_body_rows_needed - 1
 
-    # --- Write sign line items into the body table (with Alternates + bold headers/subtotals) ---
     COL_ITEM, COL_SIGN_TYPE, COL_DESC, COL_QTY, COL_UNIT, COL_TOTAL = "A", "B", "C", "D", "E", "F"
     current_row = BODY_START
     item_num = 1
@@ -518,45 +517,39 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
 
         code, summary = split_sign_type_and_summary(raw_line)
 
-        # Treat subsection headers / subtotal rows / spacer rows as "special"
-        is_header_or_subtotal = is_bold_description_row(raw_line)  # SIGN PACKAGE or "* Subtotal $..."
+        is_header_or_subtotal = is_bold_description_row(raw_line)   # SIGN PACKAGE or "* Subtotal $..."
         is_spacer = (raw_line.strip() == "")
-        is_special_row = is_header_or_subtotal or is_spacer
-
-        # ✅ Reset alternate tracking whenever we hit a special row
-        # (prevents the first real row after a header/subtotal from being mis-treated as an Alternate)
-        if is_special_row:
-            prev_primary_code = None
-
         is_priced_row = (qty_val is not None and unit_val is not None)
-        is_alternate = False
 
-        # Detect Alternate: consecutive priced rows with the same sign code
-        if is_priced_row and code and prev_primary_code == code:
-            # Only treat as alternate if there's a usable description/summary
-            if summary.strip() != "":
-                is_alternate = True
+        # ✅ Any non-priced row breaks "consecutive priced rows" alternates
+        if (not is_priced_row) or is_header_or_subtotal or is_spacer:
+            prev_row_was_priced_primary = False
+            prev_priced_primary_code = None
 
-        # Item # (keep numbering consistent across all rows)
+        # Alternate only when the PREVIOUS row was a priced primary with same code
+        is_alternate = (
+            is_priced_row
+            and bool(code)
+            and prev_row_was_priced_primary
+            and prev_priced_primary_code == code
+        )
+
         ws[f"{COL_ITEM}{current_row}"].value = item_num
 
         if is_alternate:
-            # Alternate row rules:
-            # - no sign type, no qty, no total
-            # - description prefixed with "Alternate "
-            # - unit price retained
+            # Alternate row formatting: description + unit price only
             ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
             ws[f"{COL_QTY}{current_row}"].value = None
             ws[f"{COL_TOTAL}{current_row}"].value = None
 
             alt_desc = summary if summary else raw_line
             ws[f"{COL_DESC}{current_row}"].value = f"Alternate {alt_desc}".strip()
-
             ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val)
 
-            # Do NOT update prev_primary_code (we keep it so multiple alternates stay chained)
+            # keep prev_priced_primary_code as-is (still same code)
+            prev_row_was_priced_primary = False  # alternates don't count as primaries
         else:
-            # Normal behavior:
+            # Normal behavior
             ws[f"{COL_QTY}{current_row}"].value = qty_val
             ws[f"{COL_UNIT}{current_row}"].value = round_nearest_dollar(unit_val) if unit_val is not None else None
 
@@ -567,21 +560,26 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
                 ws[f"{COL_SIGN_TYPE}{current_row}"].value = None
                 ws[f"{COL_DESC}{current_row}"].value = raw_line
 
-            if qty_val is not None and unit_val is not None:
+            if is_priced_row:
                 ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
             else:
                 ws[f"{COL_TOTAL}{current_row}"].value = None
 
-            # Track previous PRIMARY sign code only for real priced sign rows with a code
+            # Only set “previous primary” when this row is priced AND has a real code
             if is_priced_row and code:
-                prev_primary_code = code
+                prev_priced_primary_code = code
+                prev_row_was_priced_primary = True
+            else:
+                prev_priced_primary_code = None
+                prev_row_was_priced_primary = False
 
-        # Bold subsection headers + subtotal rows (description cell only)
+        # Bold subsection headers + subtotal rows (description only)
         if is_header_or_subtotal and not code:
             ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
 
         current_row += 1
         item_num += 1
+
 
     # --- Totals ---
     totals = estimate_data.get("totals", {}) or {}
