@@ -526,7 +526,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     current_row = BODY_START
     item_num = 1
 
-    prev_priced_primary_code = None
+    prev_priced_primary_sign_type = None
     prev_row_was_priced_primary = False
 
     for sign in sign_types:
@@ -554,7 +554,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
                 ws[f"{COL_DESC}{current_row}"].font = Font(bold=True)
 
             # reset alternate chaining
-            prev_priced_primary_code = None
+            prev_priced_primary_sign_type = None
             prev_row_was_priced_primary = False
 
             # Ensure row is visible
@@ -572,13 +572,13 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
         desc_summary = (split_desc.strip() if split_desc else raw_line.strip())
 
         # ✅ Alternate rule:
-        # If two consecutive PRICED rows have the same sign code,
+        # If two consecutive PRICED rows have the EXACT same full sign type,
         # the second row becomes an Alternate (description + unit price only).
         is_alternate = (
             is_priced_row
-            and bool(code_key)
+            and bool(raw_line.strip())
             and prev_row_was_priced_primary
-            and prev_priced_primary_code == code_key
+            and prev_priced_primary_sign_type == raw_line
         )
 
         if is_alternate:
@@ -600,8 +600,8 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
             ws[f"{COL_TOTAL}{current_row}"].value = f"=D{current_row}*E{current_row}"
 
             # update "previous primary" tracking
-            prev_priced_primary_code = code_key if code_key else None
-            prev_row_was_priced_primary = bool(prev_priced_primary_code)
+            prev_priced_primary_sign_type = raw_line
+            prev_row_was_priced_primary = bool(prev_priced_primary_sign_type)
 
         # Ensure row is visible
         ws.row_dimensions[current_row].hidden = False
