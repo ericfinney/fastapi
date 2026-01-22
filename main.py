@@ -654,7 +654,7 @@ SUBTOTAL_RE = re.compile(r'\bSUB[- ]?TOTAL\b', re.I)
 MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
 TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
-SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s+Type\s*&\s+Overall\b', re.I)
+SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s*Type\s*&\s*Overall', re.I)
 SIGN_PACKAGE_HEADER_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
 
 SHIPPING_HEADER_RE = re.compile(r'\bSHIPPING\b', re.I)
