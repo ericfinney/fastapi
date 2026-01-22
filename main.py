@@ -593,7 +593,7 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
             prev_row_was_priced_primary = False
         else:
             # Primary priced row output (normal)
-            ws[f"{COL_SIGN_TYPE}{current_row}"].value = code_key if code_key else None
+            ws[f"{COL_SIGN_TYPE}{current_row}"].value = split_code if split_code else None
             ws[f"{COL_QTY}{current_row}"].value = qty_val
             ws[f"{COL_DESC}{current_row}"].value = desc_summary
             ws[f"{COL_UNIT}{current_row}"].value = unit_cell_val
