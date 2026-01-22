@@ -928,16 +928,16 @@ def _section_from_line(current: str, line: str) -> str:
     if SUBTOTAL_RE.search(line) or TOTAL_RE.search(line):
         return "totals"
 
+    # Check for sign table header FIRST - this overrides everything
+    if SIGN_TABLE_HEADER_RE.search(line):
+        return "signage"
+
     if SHIPPING_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "shipping"
     if INSTALL_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "installation"
     if PERMIT_HEADER_RE.search(line) and not SIGN_TABLE_HEADER_RE.search(line):
         return "permitting"
-
-    if SIGN_TABLE_HEADER_RE.search(line):
-        if current not in ("shipping", "installation", "permitting"):
-            return "signage"
 
     return current
 
