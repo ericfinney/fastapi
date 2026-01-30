@@ -39,7 +39,7 @@ app = FastAPI()
 SUBTOTAL_EPSILON = 0.005
 
 SUBTOTAL_ROW_RE = re.compile(r'^\s*(Shipping|Install|Permitting)\s+Subtotal\s+\$', re.I)
-SIGN_PACKAGE_HEADER_RE_EXCEL = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
+SIGN_PACKAGE_HEADER_RE_EXCEL = re.compile(r'\bPACKAGE\s*$', re.I)  # Match any line ending with PACKAGE
 
 # Strict sign code: letter '.' digit ... (prevents BLDG. from matching)
 SIGN_CODE_STRICT_RE = re.compile(r'^\s*([A-Za-z]\.(?:\d+[A-Za-z0-9]*)(?:\.\d+[A-Za-z0-9]*)*)\b')
@@ -655,7 +655,7 @@ MARKUP_RE = re.compile(r'\bMARK[- ]?UP\b', re.I)
 TOTAL_RE = re.compile(r'^\s*TOTAL\b', re.I)
 
 SIGN_TABLE_HEADER_RE = re.compile(r'^\s*Sign\s*Type\s*&\s*Overall', re.I)
-SIGN_PACKAGE_HEADER_RE = re.compile(r'\bSIGN(?:AGE)?\s+PACKAGE\b\s*$', re.I)
+SIGN_PACKAGE_HEADER_RE = re.compile(r'\bPACKAGE\s*$', re.I)  # Match any line ending with PACKAGE
 
 SHIPPING_HEADER_RE = re.compile(r'\bSHIPPING\b', re.I)
 INSTALL_HEADER_RE = re.compile(r'\bINSTALL(?:ATION)?\b', re.I)
