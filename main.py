@@ -179,7 +179,7 @@ def looks_like_sign_code(code: str) -> bool:
         return False
     if not re.match(r"^[A-Za-z0-9]", c):
         return False
-    if not re.match(r"^[A-Za-z0-9./&_ ,]+$", c):
+    if not re.match(r"^[A-Za-z0-9./&_ ,\-]+$", c):
         return False
     return True
 
