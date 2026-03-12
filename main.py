@@ -165,19 +165,12 @@ def restore_row_heights(ws, heights: dict, row_offset: int):
 # =========================================================
 # Sign type + summary split (ROBUST)
 # =========================================================
-# Split only on a dash that has whitespace on at least one side.
-# This preserves code-internal hyphens like "ID-01" and "ID-05".
 # Handles:
 #   "A1 - Room ID"
 #   "A1- Room ID"
 #   "A1 -Room ID"
-#   "ID-01 - Room ID"
-#   "ID-05 - Office ID w/ Inserts"
 #   "E5.P&P, D/F - Double Sided 12 x 18 DOT, Post w/ Plate Mount"
-TYPE_DESC_SPLIT_RE = re.compile(
-    r"(?:\s+[-–—]\s*|\s*[-–—]\s+)",
-    flags=re.UNICODE
-)
+TYPE_DESC_SPLIT_RE = re.compile(r"(?:\s+[-–—]\s*|\s*[-–—]\s+)", flags=re.UNICODE)
 
 def looks_like_sign_code(code: str) -> bool:
     """
