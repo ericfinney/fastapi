@@ -3,3 +3,4 @@ uvicorn
 openpyxl
 python-multipart
 pillow
+requests
