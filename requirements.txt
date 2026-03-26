@@ -4,3 +4,5 @@ openpyxl
 python-multipart
 pillow
 requests
+pydantic
+pypdf
