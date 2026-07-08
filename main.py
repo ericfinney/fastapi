@@ -16,6 +16,7 @@ from openpyxl.styles import Protection, Font
 from pydantic import BaseModel
 from pypdf import PdfReader
 import base64
+import httpx
 from io import BytesIO
 from pathlib import Path
 
@@ -445,6 +446,20 @@ def download_file(filename: str):
 class GenerateFromPdfRequest(BaseModel):
     pdf_base64: str
     filename: str = "estimate.pdf"
+
+
+class OpenAIFileRef(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    mime_type: Optional[str] = None
+    download_link: str
+
+
+class GenerateProposalActionRequest(BaseModel):
+    openaiFileIdRefs: List[OpenAIFileRef]
+
+
+MAX_ACTION_DOWNLOAD_BYTES = int(os.environ.get("BOYD_MAX_ACTION_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1125,78 +1140,150 @@ def parse_boyd_estimate_streaming(reader: PdfReader) -> dict:
 # =============================================================================
 # PDF upload endpoint
 # =============================================================================
+def _process_pdf_bytes(pdf_bytes: bytes) -> Dict[str, Any]:
+    pdf_file = BytesIO(pdf_bytes)
+    reader = PdfReader(pdf_file)
+
+    num_pages = len(reader.pages)
+    logging.info("PDF pages: %d", num_pages)
+
+    use_streaming = num_pages >= MAX_PDF_PAGES_STREAMING
+    estimate_data = None
+
+    if use_streaming:
+        logging.info("Using streaming parser (page-by-page) due to page count.")
+        estimate_data = parse_boyd_estimate_streaming(reader)
+    else:
+        text_parts = []
+        total_chars = 0
+        for page in reader.pages:
+            t = page.extract_text() or ""
+            total_chars += len(t)
+            text_parts.append(t)
+            if total_chars > MAX_EXTRACTED_TEXT_CHARS:
+                logging.info(
+                    "Extracted text exceeds %d chars; switching to streaming fallback.",
+                    MAX_EXTRACTED_TEXT_CHARS
+                )
+                estimate_data = parse_boyd_estimate_streaming(reader)
+                break
+
+        if estimate_data is None:
+            text = "\n".join(text_parts) + "\n"
+            estimate_data = parse_boyd_estimate_from_text(text)
+
+    items_count = len(estimate_data.get("sign_types", []))
+    logging.info("Parsed sign line items (including subsection headers and subtotals): %d", items_count)
+
+    if items_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No sign line items found in PDF (could not detect sign section or parse price rows)."
+        )
+
+    cleanup_old_generated_workbooks(OUTPUT_DIR)
+
+    unique_id = uuid.uuid4().hex
+    output_filename = f"Boyd_Proposal_{unique_id}.xlsx"
+    output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+    generate_excel_from_data(estimate_data, output_path)
+
+    return {
+        "estimate_data": estimate_data,
+        "items_count": items_count,
+        "output_filename": output_filename,
+        "output_path": output_path,
+        "used_streaming_fallback": use_streaming,
+    }
+
+
 @app.post("/generate_proposal_from_pdf")
 async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
     try:
         logging.info("Processing PDF: %s", request.filename)
 
         pdf_bytes = base64.b64decode(request.pdf_base64)
-        pdf_file = BytesIO(pdf_bytes)
-        reader = PdfReader(pdf_file)
-
-        num_pages = len(reader.pages)
-        logging.info("PDF pages: %d", num_pages)
-
-        use_streaming = num_pages >= MAX_PDF_PAGES_STREAMING
-        estimate_data = None
-
-        if use_streaming:
-            logging.info("Using streaming parser (page-by-page) due to page count.")
-            estimate_data = parse_boyd_estimate_streaming(reader)
-        else:
-            text_parts = []
-            total_chars = 0
-            for page in reader.pages:
-                t = page.extract_text() or ""
-                total_chars += len(t)
-                text_parts.append(t)
-                if total_chars > MAX_EXTRACTED_TEXT_CHARS:
-                    logging.info(
-                        "Extracted text exceeds %d chars; switching to streaming fallback.",
-                        MAX_EXTRACTED_TEXT_CHARS
-                    )
-                    estimate_data = parse_boyd_estimate_streaming(reader)
-                    break
-
-            if estimate_data is None:
-                text = "\n".join(text_parts) + "\n"
-                estimate_data = parse_boyd_estimate_from_text(text)
-
-        items_count = len(estimate_data.get("sign_types", []))
-        logging.info("Parsed sign line items (including subsection headers and subtotals): %d", items_count)
-
-        if items_count == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="No sign line items found in PDF (could not detect sign section or parse price rows)."
-            )
-
-        cleanup_old_generated_workbooks(OUTPUT_DIR)
-
-        unique_id = uuid.uuid4().hex
-        output_filename = f"Boyd_Proposal_{unique_id}.xlsx"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-
-        generate_excel_from_data(estimate_data, output_path)
+        result = _process_pdf_bytes(pdf_bytes)
+        estimate_data = result["estimate_data"]
 
         base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
         if not base_url:
             base_url = "https://fastapi-production-37f6.up.railway.app"
 
-        download_url = f"{base_url}/download/{output_filename}"
+        download_url = f"{base_url}/download/{result['output_filename']}"
 
         return {
             "status": "success",
-            "filename": output_filename,
+            "filename": result["output_filename"],
             "download_url": download_url,
-            "items_count": items_count,
+            "items_count": result["items_count"],
             "project_id": estimate_data.get("project_id", ""),
             "total": estimate_data.get("totals", {}).get("total", None),
-            "used_streaming_fallback": bool(use_streaming)
+            "used_streaming_fallback": bool(result["used_streaming_fallback"])
         }
 
     except HTTPException:
         raise
     except Exception as e:
         logging.error("Error processing PDF: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+
+
+# =============================================================================
+# ChatGPT Action endpoint
+# Matches the custom GPT's OpenAPI schema: accepts a ChatGPT-uploaded file
+# reference (with a download_link the server fetches itself) and returns the
+# generated workbook inline as base64 via openaiFileResponse.
+# =============================================================================
+@app.post("/actions/generate_proposal_from_pdf")
+async def generate_proposal_from_pdf_action(request: GenerateProposalActionRequest):
+    if not request.openaiFileIdRefs:
+        raise HTTPException(status_code=400, detail="No file provided. Upload exactly one PDF.")
+
+    file_ref = request.openaiFileIdRefs[0]
+    filename = file_ref.name or "estimate.pdf"
+
+    try:
+        logging.info("Fetching ChatGPT-uploaded PDF: %s", filename)
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            resp = await client.get(file_ref.download_link)
+            resp.raise_for_status()
+            pdf_bytes = resp.content
+
+        if len(pdf_bytes) > MAX_ACTION_DOWNLOAD_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"PDF exceeds max size of {MAX_ACTION_DOWNLOAD_BYTES} bytes."
+            )
+
+        result = _process_pdf_bytes(pdf_bytes)
+        estimate_data = result["estimate_data"]
+
+        with open(result["output_path"], "rb") as f:
+            xlsx_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        return {
+            "status": "success",
+            "filename": result["output_filename"],
+            "items_count": result["items_count"],
+            "project_id": estimate_data.get("project_id", ""),
+            "total": estimate_data.get("totals", {}).get("total", None),
+            "openaiFileResponse": [
+                {
+                    "name": result["output_filename"],
+                    "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "content": xlsx_b64,
+                }
+            ],
+        }
+
+    except HTTPException:
+        raise
+    except httpx.HTTPError as e:
+        logging.error("Error downloading ChatGPT-uploaded PDF: %s", e, exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Could not download uploaded PDF: {str(e)}")
+    except Exception as e:
+        logging.error("Error processing PDF action: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
