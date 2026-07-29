@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Boyd Proposal Generator</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; color: #222; }
+  h1 { font-size: 1.4rem; }
+  p.hint { color: #555; }
+  #drop { border: 2px dashed #999; border-radius: 8px; padding: 40px; text-align: center; margin: 24px 0; }
+  #drop.dragover { border-color: #2563eb; background: #eff6ff; }
+  button { background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+  button:disabled { background: #93c5fd; cursor: not-allowed; }
+  #status { margin-top: 20px; }
+  #status a { font-weight: 600; }
+  .error { color: #b91c1c; }
+</style>
+</head>
+<body>
+  <h1>Boyd Proposal Generator</h1>
+  <p class="hint">Upload a Boyd Estimate PDF here. Use this page instead of the ChatGPT action for large PDFs that are too big for the GPT to handle.</p>
+
+  <div id="drop">
+    <input type="file" id="file" accept="application/pdf">
+    <p><button id="submit" disabled>Generate Proposal</button></p>
+  </div>
+
+  <div id="status"></div>
+
+<script>
+const fileInput = document.getElementById('file');
+const submitBtn = document.getElementById('submit');
+const statusEl = document.getElementById('status');
+const dropEl = document.getElementById('drop');
+
+fileInput.addEventListener('change', () => {
+  submitBtn.disabled = !fileInput.files.length;
+  statusEl.innerHTML = '';
+});
+
+['dragover', 'dragenter'].forEach(evt =>
+  dropEl.addEventListener(evt, e => { e.preventDefault(); dropEl.classList.add('dragover'); })
+);
+['dragleave', 'drop'].forEach(evt =>
+  dropEl.addEventListener(evt, e => { e.preventDefault(); dropEl.classList.remove('dragover'); })
+);
+dropEl.addEventListener('drop', e => {
+  if (e.dataTransfer.files.length) {
+    fileInput.files = e.dataTransfer.files;
+    submitBtn.disabled = false;
+    statusEl.innerHTML = '';
+  }
+});
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+submitBtn.addEventListener('click', async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  submitBtn.disabled = true;
+  statusEl.innerHTML = 'Processing PDF, please wait...';
+
+  try {
+    const pdf_base64 = await readFileAsBase64(file);
+    const res = await fetch('/generate_proposal_from_pdf', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pdf_base64, filename: file.name }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) {
+      statusEl.innerHTML = `<p class="error">${(data && data.detail) || 'Something went wrong processing the PDF.'}</p>`;
+      return;
+    }
+
+    statusEl.innerHTML = `<p>Done. <a href="${data.download_url}" target="_blank" rel="noopener">Download ${data.filename}</a></p>`;
+  } catch (err) {
+    statusEl.innerHTML = `<p class="error">Request failed: ${err.message}</p>`;
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
