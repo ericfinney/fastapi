@@ -997,21 +997,6 @@ def generate_excel_from_data(estimate_data: dict, output_path: str):
     wb.save(output_path)
 
 
-def build_action_file_response(file_path: str, filename: Optional[str] = None) -> Dict[str, Any]:
-    resolved_name = filename or os.path.basename(file_path)
-    with open(file_path, "rb") as f:
-        content_b64 = base64.b64encode(f.read()).decode("utf-8")
-    return {
-        "openaiFileResponse": [
-            {
-                "name": resolved_name,
-                "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "content": content_b64,
-            }
-        ]
-    }
-
-
 def download_openai_pdf(file_ref: OpenAIFileRef) -> bytes:
     if not file_ref.download_link:
         raise HTTPException(status_code=400, detail="Missing download_link on uploaded file.")
@@ -1162,15 +1147,17 @@ async def generate_proposal_from_pdf_action(
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         generate_excel_from_data(estimate_data, output_path)
 
-        action_file_payload = build_action_file_response(output_path, output_filename)
-        action_file_payload.update({
+        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "https://YOUR-RAILWAY-DOMAIN.up.railway.app"
+        download_url = f"{base_url}/download/{output_filename}"
+
+        return JSONResponse({
             "status": "success",
             "filename": output_filename,
+            "download_url": download_url,
             "items_count": items_count,
             "project_id": estimate_data.get("project_id", ""),
             "total": estimate_data.get("totals", {}).get("total", None),
         })
-        return JSONResponse(action_file_payload)
 
     except HTTPException:
         raise
