@@ -3,5 +3,6 @@ uvicorn
 openpyxl
 python-multipart
 pillow
+requests
+pydantic
 pypdf
-httpx
