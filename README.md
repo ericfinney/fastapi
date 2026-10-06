@@ -39,40 +39,51 @@ includes the [AWS Lambda Web Adapter](https://github.com/awslabs/aws-lambda-web-
 and `template.yaml` (AWS SAM) creates the function, its URL, the bucket and
 permissions. The same image still runs anywhere with `docker run`.
 
-### Prerequisites
+### Deploying (no local tools needed)
 
-- AWS CLI configured for your account (`aws configure` or SSO)
-- [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
-- Docker running locally
+GitHub Actions builds and deploys on every push to `main`
+(`.github/workflows/deploy-aws.yml`). It signs in to AWS with GitHub's OIDC
+identity — no AWS keys are stored in GitHub — and can only do so from
+workflows running on `main` of this repository.
 
-### First deploy
+**1. One-time AWS setup (AWS console, ~5 minutes)**
 
-```sh
-sam build
-sam deploy --guided
-```
+1. In the AWS console, pick the region you want (top-right), e.g. `us-east-1`.
+2. Open **CloudFormation → Create stack → With new resources**.
+3. Choose **Upload a template file** and upload `deploy/aws-bootstrap.yaml`
+   from this repo (download it from GitHub first).
+4. Stack name: **`github-deploy-setup`** (the workflow looks for this name).
+5. Parameters: keep the defaults. If **IAM → Identity providers** already lists
+   `token.actions.githubusercontent.com`, set `CreateOidcProvider` to `false`.
+6. Tick **"I acknowledge that AWS CloudFormation might create IAM resources
+   with custom names"** and create the stack.
+7. When it shows `CREATE_COMPLETE`, open the **Outputs** tab and copy
+   `DeployRoleArn`.
 
-Answers for the guided prompts:
+**2. GitHub settings (Settings → Secrets and variables → Actions)**
 
-| Prompt | Answer |
-| --- | --- |
-| Stack Name | e.g. `boyd-proposals` |
-| AWS Region | your region, e.g. `us-east-1` |
-| Parameter ActionApiKey | a long random string (`openssl rand -hex 32`); the GPT Action sends it as `X-API-Key` |
-| Parameter PublicBaseUrl | leave empty (uses the Function URL) |
-| Parameter FileRetentionDays | `7` |
-| Allow SAM CLI IAM role creation | `Y` |
-| ProposalFunction Function Url has no authentication. Is this okay? | `Y` (the app checks `X-API-Key` itself) |
-| Create managed ECR repositories for all functions? | `Y` |
-| Save arguments to configuration file | `Y` |
+| Kind | Name | Value |
+| --- | --- | --- |
+| Variable | `AWS_DEPLOY_ROLE_ARN` | the `DeployRoleArn` you copied |
+| Variable | `AWS_REGION` | the region from step 1, e.g. `us-east-1` |
+| Secret | `ACTION_API_KEY` | a random string of 40+ letters and digits (e.g. from a password manager); the GPT Action sends it as `X-API-Key` |
+| Variable (optional) | `PUBLIC_BASE_URL` | only if you put a custom domain in front, e.g. `https://api.example.com` |
 
-The `FunctionUrl` output is your new API base URL. Check it:
+**3. Deploy**
 
-```sh
-curl https://<function-url>/health   # expect "storage": "s3"
-```
+Merge to `main`, or go to **Actions → Deploy to AWS → Run workflow**. The
+run summary shows the API base URL; the workflow fails if `/health` on the
+new deployment doesn't report `"storage": "s3"`. Until step 2 is done the
+workflow is skipped rather than failing.
 
-Later deploys: `sam build && sam deploy`.
+**4. Switch over**
+
+Point the Custom GPT Action's server URL at the new base URL, run one real
+PDF through it, then retire the Railway service and delete `railway.json`,
+`railway.toml`, `nixpacks.toml` and `procfile`.
+
+Deploying from your own machine instead also works if you have the AWS CLI,
+SAM CLI and Docker: `sam build && sam deploy --guided`.
 
 ### Environment variables
 
