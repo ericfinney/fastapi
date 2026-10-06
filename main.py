@@ -11,8 +11,9 @@ from io import BytesIO
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, Body, HTTPException, Header
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from functools import lru_cache
+from fastapi import FastAPI, Body, HTTPException, Header, Request
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, RedirectResponse
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Protection, Font
@@ -34,8 +35,55 @@ ACTION_API_KEY = os.environ.get("ACTION_API_KEY", "").strip()
 MAX_PDF_PAGES_STREAMING = int(os.environ.get("BOYD_MAX_PDF_PAGES_STREAMING", "40"))
 MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "250000"))
 
+# Optional S3 storage for generated workbooks. Required on Lambda (or any
+# multi-instance host), where local disk isn't shared between requests.
+S3_BUCKET = os.environ.get("BOYD_S3_BUCKET", "").strip()
+S3_PREFIX = os.environ.get("BOYD_S3_PREFIX", "proposals/")
+DOWNLOAD_URL_TTL_SECONDS = int(os.environ.get("BOYD_DOWNLOAD_URL_TTL_SECONDS", "300"))
+
+GENERATED_FILENAME_RE = re.compile(r"^Boyd_Proposal_[0-9a-f]{32}\.xlsx$")
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 app = FastAPI()
+
+
+def public_base_url(http_request: Request) -> str:
+    """Base URL used to build download links.
+
+    Prefer an explicit PUBLIC_BASE_URL (e.g. https://api.example.com). The
+    legacy RAILWAY_PUBLIC_URL is still honoured; otherwise fall back to the
+    URL the request arrived on (run uvicorn with --proxy-headers behind a
+    load balancer so the scheme is https).
+    """
+    configured = (
+        os.environ.get("PUBLIC_BASE_URL", "").strip()
+        or os.environ.get("RAILWAY_PUBLIC_URL", "").strip()
+    )
+    return (configured or str(http_request.base_url)).rstrip("/")
+
+
+@lru_cache(maxsize=1)
+def s3_client():
+    import boto3  # only needed when S3 storage is configured
+    from botocore.config import Config
+
+    # SigV4 explicitly: boto3 otherwise presigns with legacy SigV2 in some
+    # regions, which newer regions reject.
+    return boto3.client("s3", config=Config(signature_version="s3v4"))
+
+
+def store_generated_workbook(local_path: str, filename: str) -> None:
+    """Upload a generated workbook to S3 (if configured) and drop the local copy."""
+    if not S3_BUCKET:
+        return
+    s3_client().upload_file(
+        local_path,
+        S3_BUCKET,
+        S3_PREFIX + filename,
+        ExtraArgs={"ContentType": XLSX_MEDIA_TYPE},
+    )
+    os.remove(local_path)
 
 # Treat anything smaller than half a cent as zero (guards rounding noise)
 SUBTOTAL_EPSILON = 0.005
@@ -1025,11 +1073,12 @@ def health_check():
         "logo_exists": os.path.exists(LOGO_PATH),
         "logo_path": LOGO_PATH,
         "action_api_key_enabled": bool(ACTION_API_KEY),
+        "storage": "s3" if S3_BUCKET else "local",
     }
 
 
 @app.post("/generate_proposal")
-def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
+def generate_proposal(http_request: Request, payload: Dict[str, Any] = Body(default=None)):
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
@@ -1051,28 +1100,51 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         out_name = f"Boyd_Proposal_{file_id}.xlsx"
         out_path = os.path.join(OUTPUT_DIR, out_name)
         generate_excel_from_data(estimate_data, out_path)
+        store_generated_workbook(out_path, out_name)
     except HTTPException:
         raise
     except Exception as e:
         logging.exception("Proposal generation failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-    base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "https://YOUR-RAILWAY-DOMAIN.up.railway.app"
+    base_url = public_base_url(http_request)
     download_url = f"{base_url}/download/{out_name}"
     return JSONResponse({"download_url": download_url, "filename": out_name})
 
 
 @app.get("/download/{filename}")
 def download_file(filename: str):
+    if not GENERATED_FILENAME_RE.match(filename):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if S3_BUCKET:
+        from botocore.exceptions import ClientError
+
+        key = S3_PREFIX + filename
+        try:
+            s3_client().head_object(Bucket=S3_BUCKET, Key=key)
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") in ("404", "403", "NoSuchKey", "NotFound"):
+                raise HTTPException(status_code=404, detail="File not found")
+            raise
+        # Sign a fresh short-lived URL per click, so the link we hand out
+        # never expires on its own; the bucket lifecycle rule bounds it.
+        url = s3_client().generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": S3_BUCKET,
+                "Key": key,
+                "ResponseContentDisposition": f'attachment; filename="{filename}"',
+            },
+            ExpiresIn=DOWNLOAD_URL_TTL_SECONDS,
+        )
+        return RedirectResponse(url, status_code=307)
+
     file_path = os.path.join(OUTPUT_DIR, filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
-    return FileResponse(
-        file_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=filename,
-    )
+    return FileResponse(file_path, media_type=XLSX_MEDIA_TYPE, filename=filename)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1085,7 +1157,7 @@ async def web_interface():
 
 
 @app.post("/generate_proposal_from_pdf")
-async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
+async def generate_proposal_from_pdf(request: GenerateFromPdfRequest, http_request: Request):
     try:
         logging.info("Processing PDF (base64 endpoint): %s", request.filename)
         pdf_bytes = base64.b64decode(request.pdf_base64)
@@ -1100,8 +1172,9 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
         output_filename = f"Boyd_Proposal_{unique_id}.xlsx"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         generate_excel_from_data(estimate_data, output_path)
+        store_generated_workbook(output_path, output_filename)
 
-        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "https://YOUR-RAILWAY-DOMAIN.up.railway.app"
+        base_url = public_base_url(http_request)
         download_url = f"{base_url}/download/{output_filename}"
 
         return {
@@ -1123,6 +1196,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
 @app.post("/actions/generate_proposal_from_pdf")
 async def generate_proposal_from_pdf_action(
     request: GenerateFromOpenAIFileRequest,
+    http_request: Request,
     x_api_key: Optional[str] = Header(default=None),
 ):
     try:
@@ -1146,8 +1220,9 @@ async def generate_proposal_from_pdf_action(
         output_filename = f"Boyd_Proposal_{unique_id}.xlsx"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         generate_excel_from_data(estimate_data, output_path)
+        store_generated_workbook(output_path, output_filename)
 
-        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "https://YOUR-RAILWAY-DOMAIN.up.railway.app"
+        base_url = public_base_url(http_request)
         download_url = f"{base_url}/download/{output_filename}"
 
         return JSONResponse({
