@@ -10,3 +10,6 @@ railway.json
 railway.toml
 nixpacks.toml
 procfile
+.aws-sam/
+samconfig.toml
+template.yaml

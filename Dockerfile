@@ -1,12 +1,18 @@
 FROM python:3.12-slim
 
+# Lambda Web Adapter: lets this same image run on AWS Lambda. It is a Lambda
+# extension, so it's inert on any other host (Docker, ECS, Lightsail...).
+COPY --from=public.ecr.aws/awsguru/aws-lambda-adapter:1.1.0 /lambda-adapter /opt/extensions/lambda-adapter
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8000 \
     BOYD_OUTPUT_DIR=/tmp/output \
-    # Trust X-Forwarded-* from the load balancer (ALB / App Runner) so
+    # Trust X-Forwarded-* from the front door (Lambda Function URL / load balancer) so
     # request URLs are https. Narrow this if the container is directly exposed.
-    FORWARDED_ALLOW_IPS=*
+    FORWARDED_ALLOW_IPS=* \
+    AWS_LWA_PORT=8000 \
+    AWS_LWA_READINESS_CHECK_PATH=/health
 
 WORKDIR /app
 
