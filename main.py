@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, Body, HTTPException, Header
+from fastapi import FastAPI, Body, HTTPException, Header, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
@@ -36,6 +36,21 @@ MAX_EXTRACTED_TEXT_CHARS = int(os.environ.get("BOYD_MAX_EXTRACTED_TEXT_CHARS", "
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 app = FastAPI()
+
+
+def public_base_url(http_request: Request) -> str:
+    """Base URL used to build download links.
+
+    Prefer an explicit PUBLIC_BASE_URL (e.g. https://api.example.com). The
+    legacy RAILWAY_PUBLIC_URL is still honoured; otherwise fall back to the
+    URL the request arrived on (run uvicorn with --proxy-headers behind a
+    load balancer so the scheme is https).
+    """
+    configured = (
+        os.environ.get("PUBLIC_BASE_URL", "").strip()
+        or os.environ.get("RAILWAY_PUBLIC_URL", "").strip()
+    )
+    return (configured or str(http_request.base_url)).rstrip("/")
 
 # Treat anything smaller than half a cent as zero (guards rounding noise)
 SUBTOTAL_EPSILON = 0.005
@@ -1029,7 +1044,7 @@ def health_check():
 
 
 @app.post("/generate_proposal")
-def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
+def generate_proposal(http_request: Request, payload: Dict[str, Any] = Body(default=None)):
     if not payload or "payload" not in payload:
         raise HTTPException(status_code=400, detail="Missing required field 'payload' (JSON string).")
 
@@ -1057,7 +1072,7 @@ def generate_proposal(payload: Dict[str, Any] = Body(default=None)):
         logging.exception("Proposal generation failed")
         raise HTTPException(status_code=500, detail=str(e))
 
-    base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "https://YOUR-RAILWAY-DOMAIN.up.railway.app"
+    base_url = public_base_url(http_request)
     download_url = f"{base_url}/download/{out_name}"
     return JSONResponse({"download_url": download_url, "filename": out_name})
 
@@ -1085,7 +1100,7 @@ async def web_interface():
 
 
 @app.post("/generate_proposal_from_pdf")
-async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
+async def generate_proposal_from_pdf(request: GenerateFromPdfRequest, http_request: Request):
     try:
         logging.info("Processing PDF (base64 endpoint): %s", request.filename)
         pdf_bytes = base64.b64decode(request.pdf_base64)
@@ -1101,7 +1116,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         generate_excel_from_data(estimate_data, output_path)
 
-        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "https://YOUR-RAILWAY-DOMAIN.up.railway.app"
+        base_url = public_base_url(http_request)
         download_url = f"{base_url}/download/{output_filename}"
 
         return {
@@ -1123,6 +1138,7 @@ async def generate_proposal_from_pdf(request: GenerateFromPdfRequest):
 @app.post("/actions/generate_proposal_from_pdf")
 async def generate_proposal_from_pdf_action(
     request: GenerateFromOpenAIFileRequest,
+    http_request: Request,
     x_api_key: Optional[str] = Header(default=None),
 ):
     try:
@@ -1147,7 +1163,7 @@ async def generate_proposal_from_pdf_action(
         output_path = os.path.join(OUTPUT_DIR, output_filename)
         generate_excel_from_data(estimate_data, output_path)
 
-        base_url = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/") or "https://YOUR-RAILWAY-DOMAIN.up.railway.app"
+        base_url = public_base_url(http_request)
         download_url = f"{base_url}/download/{output_filename}"
 
         return JSONResponse({
