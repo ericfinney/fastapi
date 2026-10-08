@@ -69,8 +69,18 @@ def s3_client():
     from botocore.config import Config
 
     # SigV4 explicitly: boto3 otherwise presigns with legacy SigV2 in some
-    # regions, which newer regions reject.
-    return boto3.client("s3", config=Config(signature_version="s3v4"))
+    # regions, which newer regions reject. Regional virtual-hosted endpoint:
+    # by default boto3 presigns for <bucket>.s3.amazonaws.com, which S3
+    # redirects to the regional host for new buckets outside us-east-1 --
+    # and the redirect breaks the signature (SignatureDoesNotMatch).
+    region = boto3.session.Session().region_name
+    endpoint = {"endpoint_url": f"https://s3.{region}.amazonaws.com"} if region else {}
+    return boto3.client(
+        "s3",
+        region_name=region,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+        **endpoint,
+    )
 
 
 def store_generated_workbook(local_path: str, filename: str) -> None:

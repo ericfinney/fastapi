@@ -1,6 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Boyd proposal generator (FastAPI on Lambda via Lambda Web Adapter)
+# NOT for the CloudFormation console: this needs a built container image and
+# is deployed by .github/workflows/deploy-aws.yml. For the one-time console
+# setup, upload deploy/aws-bootstrap.yaml instead.
+Description: >-
+  APP TEMPLATE - deployed by GitHub Actions, do not upload in the console
+  (use deploy/aws-bootstrap.yaml for setup). Boyd proposal generator on Lambda.
 
 Parameters:
   ActionApiKey:

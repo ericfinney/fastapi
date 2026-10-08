@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  One-time setup so GitHub Actions can deploy the Boyd proposal API with no
+  SETUP TEMPLATE - upload this one in the CloudFormation console. One-time setup so GitHub Actions can deploy the Boyd proposal API with no
   long-lived AWS keys. Create this stack in the CloudFormation console.
 
 Parameters:
@@ -167,6 +167,12 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # With a service role, CloudFormation runs the SAM transform
+              # (template.yaml's Transform line) as this role.
+              - Sid: SamTransform
+                Effect: Allow
+                Action: cloudformation:CreateChangeSet
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:aws:transform/Serverless-2016-10-31"
               - Sid: Lambda
                 Effect: Allow
                 Action: lambda:*
