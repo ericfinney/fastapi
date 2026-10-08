@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  One-time setup so GitHub Actions can deploy the Boyd proposal API with no
+  SETUP TEMPLATE - upload this one in the CloudFormation console. One-time setup so GitHub Actions can deploy the Boyd proposal API with no
   long-lived AWS keys. Create this stack in the CloudFormation console.
 
 Parameters:

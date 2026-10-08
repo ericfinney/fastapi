@@ -50,8 +50,12 @@ workflows running on `main` of this repository.
 
 1. In the AWS console, pick the region you want (top-right), e.g. `us-east-1`.
 2. Open **CloudFormation → Create stack → With new resources**.
-3. Choose **Upload a template file** and upload `deploy/aws-bootstrap.yaml`
-   from this repo (download it from GitHub first).
+3. Choose **Upload a template file** and upload **`deploy/aws-bootstrap.yaml`**
+   (on GitHub open the `deploy` folder → `aws-bootstrap.yaml` → *Download raw
+   file*). Not `template.yaml` at the repo root — that one is deployed by the
+   workflow and fails in the console with "'ImageUri' must be set". On the next
+   screen the parameters should be `GitHubRepo`, `GitHubBranch`,
+   `AppStackName` and `CreateOidcProvider`.
 4. Stack name: **`github-deploy-setup`** (the workflow looks for this name).
 5. Parameters: keep the defaults. If **IAM → Identity providers** already lists
    `token.actions.githubusercontent.com`, set `CreateOidcProvider` to `false`.
